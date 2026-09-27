@@ -8,7 +8,7 @@ const token = process.env.BOT_TOKEN;
 const adminId = Number(process.env.ADMIN_ID);
 
 if (!token) {
-  throw new Error("BOT_TOKEN не найден в .env");
+  throw new Error("BOT_TOKEN не найден в Environment Variables");
 }
 
 if (!adminId) {
