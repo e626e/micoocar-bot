@@ -69,7 +69,6 @@ async function telegram(method, body = {}) {
 // EXPRESS API
 // =========================
 
-const app = express();
 
 const PORT = process.env.PORT || 3000;
 
