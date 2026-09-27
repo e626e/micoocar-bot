@@ -3,7 +3,11 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
+const cors = require('cors');
 
+const app = express();
+
+app.use(cors());
 const token = process.env.BOT_TOKEN;
 const adminId = Number(process.env.ADMIN_ID);
 
