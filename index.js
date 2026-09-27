@@ -333,11 +333,23 @@ async function handleCallback(callback) {
       callback.message.caption ||
       "";
 
+    const sourceMessage = await telegram("forwardMessage", {
+      chat_id: chatId,
+      from_chat_id: sourceChatId,
+      message_id: sourceMessageId,
+    });
+
+    const sourcePhoto =
+      sourceMessage?.result?.photo?.length
+        ? sourceMessage.result.photo[sourceMessage.result.photo.length - 1].file_id
+        : null;
+
     const car = {
       id: `car_${Date.now()}`,
       sourceChatId,
       sourceMessageId,
       text,
+      photo: sourcePhoto,
       publishedAt: new Date().toISOString(),
       status: "published",
     };
