@@ -91,7 +91,7 @@ app.get("/api/cars", (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`MICOOCAR API запущен на порту ${PORT}`);
 });
 
