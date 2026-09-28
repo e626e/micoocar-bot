@@ -218,7 +218,58 @@ app.get("/api/cars", (req, res) => {
     });
   }
 });
+app.post("/api/leads", async (req, res) => {
+  try {
+    const {
+      carId,
+      brand,
+      model,
+      price,
+      vin,
+      userId,
+      username,
+      firstName,
+      lastName,
+    } = req.body || {};
 
+    const clientName =
+      [firstName, lastName].filter(Boolean).join(" ") || "Не указано";
+
+    const clientUsername = username
+      ? `@${String(username).replace(/^@/, "")}`
+      : "нет username";
+
+    const message = [
+      "🔥 НОВАЯ ЗАЯВКА MICOOCAR",
+      "",
+      `🚗 Автомобиль: ${brand || "—"} ${model || ""}`.trim(),
+      `💰 Цена: ${price || "—"}`,
+      `🔑 VIN: ${vin || "—"}`,
+      `🆔 ID автомобиля: ${carId || "—"}`,
+      "",
+      "👤 КЛИЕНТ",
+      `Имя: ${clientName}`,
+      `Telegram: ${clientUsername}`,
+      `Telegram ID: ${userId || "—"}`,
+    ].join("\n");
+
+    await sendMessage(
+      -1004356831309,
+      message
+    );
+
+    res.json({
+      success: true,
+    });
+  } catch (error) {
+    console.error("API leads error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Не удалось отправить заявку",
+    });
+  }
+});
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`MICOOCAR API запущен на порту ${PORT}`);
 });
