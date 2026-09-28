@@ -76,6 +76,44 @@ app.get("/", (req, res) => {
   res.send("MICOOCAR API работает");
 });
 
+app.get("/api/cars/:id/photo", async (req, res) => {
+  try {
+    const cars = readCars();
+    const car = cars.find(item => String(item.id) === String(req.params.id));
+
+    if (!car || !car.photo) {
+      return res.status(404).send("Фото не найдено");
+    }
+
+    const fileResult = await telegram("getFile", {
+      file_id: car.photo
+    });
+
+    const filePath = fileResult?.result?.file_path;
+
+    if (!filePath) {
+      return res.status(404).send("Файл Telegram не найден");
+    }
+
+    const imageUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+    const response = await fetch(imageUrl);
+
+    if (!response.ok) {
+      return res.status(502).send("Не удалось получить фото");
+    }
+
+    const contentType = response.headers.get("content-type") || "image/jpeg";
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    res.set("Content-Type", contentType);
+    res.set("Cache-Control", "public, max-age=86400");
+    res.send(buffer);
+  } catch (error) {
+    console.error("Ошибка получения фото:", error);
+    res.status(500).send("Ошибка сервера");
+  }
+});
+
 app.get("/api/cars", (req, res) => {
   try {
     const cars = readCars();
