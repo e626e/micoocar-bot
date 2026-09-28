@@ -21,13 +21,54 @@ if (!adminId) {
 
 const api = `https://api.telegram.org/bot${token}`;
 const carsFile = path.join(__dirname, "cars.json");
-
+const githubToken = process.env.GITHUB_TOKEN;
+const githubOwner = process.env.GITHUB_OWNER;
+const githubRepo = process.env.GITHUB_REPO;
 // =========================
 // FILE STORAGE
 // =========================
 
 if (!fs.existsSync(carsFile)) {
   fs.writeFileSync(carsFile, "[]");
+}
+async function syncCarsFromGitHub() {
+  if (!githubToken || !githubOwner || !githubRepo) {
+    console.log("GitHub storage не настроен. Используется локальный cars.json.");
+    return;
+  }
+
+  try {
+    const url =
+      `https://api.github.com/repos/${githubOwner}/${githubRepo}/contents/cars.json`;
+
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`GitHub GET error: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    const content = Buffer.from(
+      data.content.replace(/\n/g, ""),
+      "base64"
+    ).toString("utf8");
+
+    fs.writeFileSync(carsFile, content);
+
+    console.log("✅ cars.json загружен из GitHub");
+  } catch (error) {
+    console.error(
+      "Ошибка загрузки cars.json из GitHub:",
+      error
+    );
+  }
 }
 
 function readCars() {
@@ -39,10 +80,56 @@ function readCars() {
   }
 }
 
-function saveCars(cars) {
-  fs.writeFileSync(carsFile, JSON.stringify(cars, null, 2));
-}
+async function saveCars(cars) {
+  const content = JSON.stringify(cars, null, 2);
 
+  fs.writeFileSync(carsFile, content);
+
+  if (!githubToken || !githubOwner || !githubRepo) {
+    return;
+  }
+
+  try {
+    const url =
+      `https://api.github.com/repos/${githubOwner}/${githubRepo}/contents/cars.json`;
+
+    const getResponse = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+
+    const fileData = await getResponse.json();
+
+    const putResponse = await fetch(url, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message: "Update cars.json",
+        content: Buffer.from(content).toString("base64"),
+        sha: fileData.sha,
+      }),
+    });
+
+    if (!putResponse.ok) {
+      const errorText = await putResponse.text();
+      throw new Error(
+        `GitHub PUT error: ${putResponse.status} ${errorText}`
+      );
+    }
+
+    console.log("✅ cars.json сохранён в GitHub");
+  } catch (error) {
+    console.error("Ошибка сохранения cars.json в GitHub:", error);
+  }
+}
 // =========================
 // TELEGRAM API
 // =========================
@@ -315,7 +402,7 @@ async function handleMessage(message) {
     };
 
     cars.push(pendingCar);
-    saveCars(cars);
+    await saveCars(cars);
 
     const preview =
       `🚗 НОВЫЙ АВТОМОБИЛЬ\n\n` +
@@ -390,8 +477,7 @@ async function handleCallback(callback) {
     car.status = "published";
     car.publishedAt = new Date().toISOString();
 
-    saveCars(cars);
-
+    await saveCars(cars);
     await telegram("answerCallbackQuery", {
       callback_query_id: callback.id,
       text: "Автомобиль опубликован!",
