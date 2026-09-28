@@ -266,6 +266,19 @@ async function handleMessage(message) {
         ? message.photo[message.photo.length - 1].file_id
         : null;
 
+    const pendingCar = {
+      id: `car_${Date.now()}`,
+      sourceChatId,
+      sourceMessageId,
+      text: originalText,
+      photo,
+      publishedAt: new Date().toISOString(),
+      status: "pending",
+    };
+
+    cars.push(pendingCar);
+    saveCars(cars);
+
     const preview =
       `🚗 НОВЫЙ АВТОМОБИЛЬ\n\n` +
       `${originalText}\n\n` +
@@ -314,13 +327,21 @@ async function handleCallback(callback) {
 
     const cars = readCars();
 
-    const existing = cars.find(
-      (car) =>
-        String(car.sourceChatId) === String(sourceChatId) &&
-        String(car.sourceMessageId) === String(sourceMessageId)
+    const car = cars.find(
+      (item) =>
+        String(item.sourceChatId) === String(sourceChatId) &&
+        String(item.sourceMessageId) === String(sourceMessageId)
     );
 
-    if (existing) {
+    if (!car) {
+      await telegram("answerCallbackQuery", {
+        callback_query_id: callback.id,
+        text: "Автомобиль не найден",
+      });
+      return;
+    }
+
+    if (car.status === "published") {
       await telegram("answerCallbackQuery", {
         callback_query_id: callback.id,
         text: "Этот автомобиль уже опубликован",
@@ -328,33 +349,9 @@ async function handleCallback(callback) {
       return;
     }
 
-    const text =
-      callback.message.text ||
-      callback.message.caption ||
-      "";
+    car.status = "published";
+    car.publishedAt = new Date().toISOString();
 
-    const sourceMessage = await telegram("forwardMessage", {
-      chat_id: chatId,
-      from_chat_id: sourceChatId,
-      message_id: sourceMessageId,
-    });
-
-    const sourcePhoto =
-      sourceMessage?.result?.photo?.length
-        ? sourceMessage.result.photo[sourceMessage.result.photo.length - 1].file_id
-        : null;
-
-    const car = {
-      id: `car_${Date.now()}`,
-      sourceChatId,
-      sourceMessageId,
-      text,
-      photo: sourcePhoto,
-      publishedAt: new Date().toISOString(),
-      status: "published",
-    };
-
-    cars.push(car);
     saveCars(cars);
 
     await telegram("answerCallbackQuery", {
