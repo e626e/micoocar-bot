@@ -399,6 +399,7 @@ function isAdmin(chatId) {
 // =========================
 
 const pendingAlbums = new Map();
+const pendingCarDescriptions = new Map();
 
 function getLargestPhoto(message) {
   if (!Array.isArray(message.photo) || !message.photo.length) {
@@ -408,7 +409,7 @@ function getLargestPhoto(message) {
   return message.photo[message.photo.length - 1].file_id;
 }
 
-async function saveImportedCar(chatId, messages) {
+async function saveImportedCar(chatId, messages, descriptionOverride = '') {
   const sortedMessages = [...messages].sort(
     (a, b) => a.message_id - b.message_id
   );
@@ -426,10 +427,39 @@ async function saveImportedCar(chatId, messages) {
     message => message.caption || message.text
   );
 
-  const originalText =
-    textMessage?.caption ||
-    textMessage?.text ||
-    "Текст автомобиля отсутствует";
+  const embeddedText = String(
+    textMessage?.caption || textMessage?.text || ""
+  ).trim();
+
+  const isPlaceholder =
+    !embeddedText ||
+    /Текст автомобиля отсутствует|📝\s*Текст:\s*нет/i.test(embeddedText);
+
+  const originalText = String(
+    descriptionOverride || (isPlaceholder ? "" : embeddedText)
+  ).trim();
+
+  if (!originalText) {
+    const key = String(chatId);
+
+    if (pendingCarDescriptions.has(key)) {
+      await sendMessage(
+        chatId,
+        "⚠️ Предыдущее объявление ещё ждёт описание. Сначала отправьте его текст или /cancel, затем повторно отправьте новый альбом."
+      );
+      return;
+    }
+
+    pendingCarDescriptions.set(key, sortedMessages);
+
+    const photoCount = sortedMessages.map(getLargestPhoto).filter(Boolean).length;
+
+    await sendMessage(
+      chatId,
+      `📸 Получено фотографий: ${photoCount}.\n\nТеперь отправьте следующим сообщением полный текст этого объявления. Я объединю его со всеми фотографиями в одну карточку.\n\nДля отмены напишите /cancel.`
+    );
+    return;
+  }
 
   const photos = sortedMessages
     .map(getLargestPhoto)
@@ -537,6 +567,31 @@ function queueAlbumMessage(message) {
 async function handleMessage(message) {
   const chatId = message.chat.id;
   const text = message.text || "";
+
+  // Описание автомобиля, ожидающее после импорта альбома
+  if (isAdmin(chatId) && pendingCarDescriptions.has(String(chatId)) && message.text) {
+    const description = message.text.trim();
+
+    if (description.toLowerCase() === "/cancel") {
+      pendingCarDescriptions.delete(String(chatId));
+      await sendMessage(chatId, "Импорт альбома отменён. Автомобиль не сохранён.");
+      return;
+    }
+
+    if (description && !description.startsWith("/")) {
+      const pendingMessages = pendingCarDescriptions.get(String(chatId));
+      pendingCarDescriptions.delete(String(chatId));
+
+      try {
+        await saveImportedCar(chatId, pendingMessages, description);
+      } catch (error) {
+        console.error("Ошибка сохранения описания автомобиля:", error);
+        await sendMessage(chatId, "❌ Не удалось сохранить объявление. Попробуйте импортировать альбом заново.");
+      }
+      return;
+    }
+  }
+
 
   // /myid
   if (text === "/myid") {
