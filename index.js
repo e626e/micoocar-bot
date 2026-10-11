@@ -3,11 +3,12 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
-const cors = require('cors');
+const cors = require("cors");
 
 const app = express();
 
 app.use(cors());
+app.use(express.json({ limit: "20kb" }));
 const token = process.env.BOT_TOKEN;
 const adminId = Number(process.env.ADMIN_ID);
 
@@ -21,16 +22,20 @@ if (!adminId) {
 
 const api = `https://api.telegram.org/bot${token}`;
 const carsFile = path.join(__dirname, "cars.json");
-const githubToken = process.env.GITHUB_TOKEN;
-const githubOwner = process.env.GITHUB_OWNER;
-const githubRepo = process.env.GITHUB_REPO;
+
 // =========================
-// FILE STORAGE
+// FILE STORAGE + GITHUB
 // =========================
 
 if (!fs.existsSync(carsFile)) {
   fs.writeFileSync(carsFile, "[]");
 }
+
+const githubToken = process.env.GITHUB_TOKEN;
+const githubOwner = process.env.GITHUB_OWNER;
+const githubRepo = process.env.GITHUB_REPO;
+const githubFilePath = "cars.json";
+
 async function syncCarsFromGitHub() {
   if (!githubToken || !githubOwner || !githubRepo) {
     console.log("GitHub storage не настроен. Используется локальный cars.json.");
@@ -39,7 +44,7 @@ async function syncCarsFromGitHub() {
 
   try {
     const url =
-      `https://api.github.com/repos/${githubOwner}/${githubRepo}/contents/cars.json`;
+      `https://api.github.com/repos/${githubOwner}/${githubRepo}/contents/${githubFilePath}`;
 
     const response = await fetch(url, {
       headers: {
@@ -55,6 +60,10 @@ async function syncCarsFromGitHub() {
 
     const data = await response.json();
 
+    if (!data.content) {
+      throw new Error("GitHub cars.json не содержит content");
+    }
+
     const content = Buffer.from(
       data.content.replace(/\n/g, ""),
       "base64"
@@ -64,10 +73,7 @@ async function syncCarsFromGitHub() {
 
     console.log("✅ cars.json загружен из GitHub");
   } catch (error) {
-    console.error(
-      "Ошибка загрузки cars.json из GitHub:",
-      error
-    );
+    console.error("Ошибка загрузки cars.json из GitHub:", error);
   }
 }
 
@@ -83,6 +89,7 @@ function readCars() {
 async function saveCars(cars) {
   const content = JSON.stringify(cars, null, 2);
 
+  // Сохраняем локально
   fs.writeFileSync(carsFile, content);
 
   if (!githubToken || !githubOwner || !githubRepo) {
@@ -91,8 +98,9 @@ async function saveCars(cars) {
 
   try {
     const url =
-      `https://api.github.com/repos/${githubOwner}/${githubRepo}/contents/cars.json`;
+      `https://api.github.com/repos/${githubOwner}/${githubRepo}/contents/${githubFilePath}`;
 
+    // Получаем текущий SHA файла
     const getResponse = await fetch(url, {
       headers: {
         Authorization: `Bearer ${githubToken}`,
@@ -100,6 +108,10 @@ async function saveCars(cars) {
         "X-GitHub-Api-Version": "2022-11-28",
       },
     });
+
+    if (!getResponse.ok) {
+      throw new Error(`GitHub GET error: ${getResponse.status}`);
+    }
 
     const fileData = await getResponse.json();
 
@@ -130,6 +142,7 @@ async function saveCars(cars) {
     console.error("Ошибка сохранения cars.json в GitHub:", error);
   }
 }
+
 // =========================
 // TELEGRAM API
 // =========================
@@ -156,24 +169,40 @@ async function telegram(method, body = {}) {
 // EXPRESS API
 // =========================
 
-
 const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => {
   res.send("MICOOCAR API работает");
 });
 
-app.get("/api/cars/:id/photo", async (req, res) => {
+async function sendCarPhoto(req, res, photoIndex = 0) {
   try {
     const cars = readCars();
-    const car = cars.find(item => String(item.id) === String(req.params.id));
 
-    if (!car || !car.photo) {
+    const car = cars.find(
+      item => String(item.id) === String(req.params.id)
+    );
+
+    if (!car) {
+      return res.status(404).send("Автомобиль не найден");
+    }
+
+    // Поддержка новых и старых карточек
+    const photos =
+      Array.isArray(car.photos) && car.photos.length
+        ? car.photos
+        : car.photo
+          ? [car.photo]
+          : [];
+
+    const fileId = photos[photoIndex];
+
+    if (!fileId) {
       return res.status(404).send("Фото не найдено");
     }
 
     const fileResult = await telegram("getFile", {
-      file_id: car.photo
+      file_id: fileId,
     });
 
     const filePath = fileResult?.result?.file_path;
@@ -189,7 +218,9 @@ app.get("/api/cars/:id/photo", async (req, res) => {
       return res.status(502).send("Не удалось получить фото");
     }
 
-    const contentType = response.headers.get("content-type") || "image/jpeg";
+    const contentType =
+      response.headers.get("content-type") || "image/jpeg";
+
     const buffer = Buffer.from(await response.arrayBuffer());
 
     res.set("Content-Type", contentType);
@@ -199,17 +230,53 @@ app.get("/api/cars/:id/photo", async (req, res) => {
     console.error("Ошибка получения фото:", error);
     res.status(500).send("Ошибка сервера");
   }
+}
+
+// Старый адрес первого фото сохраняем
+app.get("/api/cars/:id/photo", (req, res) => {
+  sendCarPhoto(req, res, 0);
 });
 
+// Получение конкретного фото из галереи
+app.get("/api/cars/:id/photos/:index", (req, res) => {
+  const index = Number(req.params.index);
+
+  if (!Number.isInteger(index) || index < 0) {
+    return res.status(400).send("Неверный номер фотографии");
+  }
+
+  sendCarPhoto(req, res, index);
+});
+
+// Каталог автомобилей
 app.get("/api/cars", (req, res) => {
   try {
     const cars = readCars();
 
     const publishedCars = cars.filter(
-      (car) => car.status === "published"
+      car => car.status === "published"
     );
 
-    res.json(publishedCars);
+    res.json(
+      publishedCars.map(car => {
+        const photoCount =
+          Array.isArray(car.photos) && car.photos.length
+            ? car.photos.length
+            : car.photo
+              ? 1
+              : 0;
+
+        return {
+          ...car,
+          description: car.description || car.text || "",
+          photos: Array.from(
+            { length: photoCount },
+            (_, index) =>
+              `/api/cars/${encodeURIComponent(car.id)}/photos/${index}`
+          ),
+        };
+      })
+    );
   } catch (error) {
     console.error("API cars error:", error);
 
@@ -218,6 +285,9 @@ app.get("/api/cars", (req, res) => {
     });
   }
 });
+
+
+// Заявки из MICOOR CAR Mini App
 app.post("/api/leads", async (req, res) => {
   try {
     const {
@@ -226,51 +296,85 @@ app.post("/api/leads", async (req, res) => {
       model,
       price,
       vin,
+      phone,
       userId,
       username,
       firstName,
       lastName,
     } = req.body || {};
 
+    const phoneValue = String(phone || "").trim();
+    const phoneDigits = phoneValue.replace(/\D/g, "");
+
+    if (phoneDigits.length < 7 || phoneDigits.length > 15) {
+      return res.status(400).json({
+        success: false,
+        error: "Укажите корректный номер телефона",
+      });
+    }
+
     const clientName =
       [firstName, lastName].filter(Boolean).join(" ") || "Не указано";
 
-    const clientUsername = username
-      ? `@${String(username).replace(/^@/, "")}`
-      : "нет username";
+    const cleanUsername = String(username || "")
+      .replace(/^@/, "")
+      .trim();
+
+    const validUsername = /^[A-Za-z0-9_]{5,32}$/.test(cleanUsername);
+    const clientTelegram = validUsername
+      ? `@${cleanUsername}`
+      : "username не указан";
 
     const message = [
-      "🔥 НОВАЯ ЗАЯВКА MICOOCAR",
+      "🔥 НОВАЯ ЗАЯВКА MICOOR CAR",
       "",
-      `🚗 Автомобиль: ${brand || "—"} ${model || ""}`.trim(),
-      `💰 Цена: ${price || "—"}`,
-      `🔑 VIN: ${vin || "—"}`,
-      `🆔 ID автомобиля: ${carId || "—"}`,
+      "🚗 АВТОМОБИЛЬ",
+      `Марка и модель: ${[brand, model].filter(Boolean).join(" ") || "Не указано"}`,
+      `Цена: ${price || "Не указана"}`,
+      `VIN: ${vin || "Не указан"}`,
+      `ID автомобиля: ${carId || "—"}`,
       "",
       "👤 КЛИЕНТ",
+      `Телефон: ${phoneValue}`,
       `Имя: ${clientName}`,
-      `Telegram: ${clientUsername}`,
-      `Telegram ID: ${userId || "—"}`,
+      `Telegram: ${clientTelegram}`,
+      `Telegram ID: ${userId || "не передан"}`,
     ].join("\n");
 
-    await sendMessage(
-      -1004356831309,
-      message
-    );
+    const extra = validUsername
+      ? {
+          reply_markup: {
+            inline_keyboard: [[
+              {
+                text: "Открыть Telegram клиента",
+                url: `https://t.me/${cleanUsername}`,
+              },
+            ]],
+          },
+        }
+      : {};
 
-    res.json({
-      success: true,
-    });
+    const result = await sendMessage(-1004356831309, message, extra);
+
+    if (!result || !result.ok) {
+      console.error("Не удалось отправить заявку в группу лидов:", result);
+      return res.status(502).json({
+        success: false,
+        error: "Не удалось доставить заявку менеджеру",
+      });
+    }
+
+    return res.json({ success: true });
   } catch (error) {
-    console.error("API leads error:", error);
-
-    res.status(500).json({
+    console.error("Ошибка API leads:", error);
+    return res.status(500).json({
       success: false,
-      error: "Не удалось отправить заявку",
+      error: "Не удалось обработать заявку",
     });
   }
 });
-app.listen(PORT, '0.0.0.0', () => {
+
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`MICOOCAR API запущен на порту ${PORT}`);
 });
 
@@ -288,6 +392,142 @@ async function sendMessage(chatId, text, extra = {}) {
 
 function isAdmin(chatId) {
   return Number(chatId) === adminId;
+}
+
+// =========================
+// TELEGRAM ALBUM COLLECTOR
+// =========================
+
+const pendingAlbums = new Map();
+
+function getLargestPhoto(message) {
+  if (!Array.isArray(message.photo) || !message.photo.length) {
+    return null;
+  }
+
+  return message.photo[message.photo.length - 1].file_id;
+}
+
+async function saveImportedCar(chatId, messages) {
+  const sortedMessages = [...messages].sort(
+    (a, b) => a.message_id - b.message_id
+  );
+
+  const firstMessage = sortedMessages[0];
+
+  const sourceChatId =
+    firstMessage.forward_origin?.chat?.id ||
+    firstMessage.forward_from_chat?.id ||
+    chatId;
+
+  const sourceMessageId = firstMessage.message_id;
+
+  const textMessage = sortedMessages.find(
+    message => message.caption || message.text
+  );
+
+  const originalText =
+    textMessage?.caption ||
+    textMessage?.text ||
+    "Текст автомобиля отсутствует";
+
+  const photos = sortedMessages
+    .map(getLargestPhoto)
+    .filter(Boolean);
+
+  const cars = readCars();
+
+  const duplicate = cars.find(
+    car =>
+      String(car.sourceChatId) === String(sourceChatId) &&
+      String(car.sourceMessageId) === String(sourceMessageId)
+  );
+
+  if (duplicate) {
+    await sendMessage(
+      chatId,
+      "⚠️ Этот автомобиль уже был импортирован."
+    );
+    return;
+  }
+
+  const pendingCar = {
+    id: `car_${Date.now()}`,
+    sourceChatId,
+    sourceMessageId,
+    text: originalText,
+    description: originalText,
+    photo: photos[0] || null,
+    photos,
+    publishedAt: new Date().toISOString(),
+    status: "pending",
+  };
+
+  cars.push(pendingCar);
+
+  await saveCars(cars);
+
+  const preview =
+    `🚗 НОВЫЙ АВТОМОБИЛЬ\n\n` +
+    `${originalText}\n\n` +
+    `📸 Фотографий: ${photos.length}\n\n` +
+    `Опубликовать автомобиль?`;
+
+  await sendMessage(chatId, preview, {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "✅ Опубликовать",
+            callback_data: `publish:${sourceChatId}:${sourceMessageId}`,
+          },
+          {
+            text: "❌ Отмена",
+            callback_data: `cancel:${sourceChatId}:${sourceMessageId}`,
+          },
+        ],
+      ],
+    },
+  });
+}
+
+function queueAlbumMessage(message) {
+  const chatId = message.chat.id;
+  const key = `${chatId}:${message.media_group_id}`;
+
+  let album = pendingAlbums.get(key);
+
+  if (!album) {
+    album = {
+      chatId,
+      messages: [],
+      timer: null,
+    };
+
+    pendingAlbums.set(key, album);
+  }
+
+  album.messages.push(message);
+
+  if (album.timer) {
+    clearTimeout(album.timer);
+  }
+
+  // Ждём поступления всех фотографий альбома
+  album.timer = setTimeout(async () => {
+    pendingAlbums.delete(key);
+
+    try {
+      await saveImportedCar(album.chatId, album.messages);
+    } catch (error) {
+      console.error("Ошибка импорта альбома:", error);
+
+      await sendMessage(
+        album.chatId,
+        "❌ Не удалось импортировать альбом."
+      );
+    }
+  }, 1800);
 }
 
 // =========================
@@ -334,7 +574,7 @@ async function handleMessage(message) {
   }
 
   // Каталог
-    if (text === "🚗 Каталог") {
+  if (text === "🚗 Каталог") {
     await sendMessage(
       chatId,
       "🚗 Открывайте каталог MICOOCAR:",
@@ -354,7 +594,6 @@ async function handleMessage(message) {
 
     return;
   }
- 
 
   // Избранное
   if (text === "❤️ Избранное") {
@@ -409,75 +648,15 @@ async function handleMessage(message) {
     Boolean(message.text) ||
     Boolean(message.caption);
 
+  // Альбом: собираем все фотографии в одну карточку
+  if (isAdmin(chatId) && message.media_group_id && hasPhoto) {
+    queueAlbumMessage(message);
+    return;
+  }
+
+  // Обычная публикация или одиночное фото
   if (isAdmin(chatId) && (isForwarded || hasPhoto) && hasText) {
-    const sourceMessageId = message.message_id;
-    const sourceChatId =
-      message.forward_origin?.chat?.id ||
-      message.forward_from_chat?.id ||
-      chatId;
-
-    const originalText =
-      message.caption ||
-      message.text ||
-      "Текст автомобиля отсутствует";
-
-    const cars = readCars();
-
-    const duplicate = cars.find(
-      (car) =>
-        String(car.sourceChatId) === String(sourceChatId) &&
-        String(car.sourceMessageId) === String(sourceMessageId)
-    );
-
-    if (duplicate) {
-      await sendMessage(
-        chatId,
-        "⚠️ Этот автомобиль уже был импортирован."
-      );
-      return;
-    }
-
-    const photo =
-      hasPhoto
-        ? message.photo[message.photo.length - 1].file_id
-        : null;
-
-    const pendingCar = {
-      id: `car_${Date.now()}`,
-      sourceChatId,
-      sourceMessageId,
-      text: originalText,
-      photo,
-      publishedAt: new Date().toISOString(),
-      status: "pending",
-    };
-
-    cars.push(pendingCar);
-    await saveCars(cars);
-
-    const preview =
-      `🚗 НОВЫЙ АВТОМОБИЛЬ\n\n` +
-      `${originalText}\n\n` +
-      `📸 Фото: ${photo ? "получено" : "нет"}\n\n` +
-      `Опубликовать автомобиль?`;
-
-    await sendMessage(chatId, preview, {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "✅ Опубликовать",
-              callback_data: `publish:${sourceChatId}:${sourceMessageId}`,
-            },
-            {
-              text: "❌ Отмена",
-              callback_data: `cancel:${sourceChatId}:${sourceMessageId}`,
-            },
-          ],
-        ],
-      },
-    });
-
+    await saveImportedCar(chatId, [message]);
     return;
   }
 }
@@ -504,7 +683,7 @@ async function handleCallback(callback) {
     const cars = readCars();
 
     const car = cars.find(
-      (item) =>
+      item =>
         String(item.sourceChatId) === String(sourceChatId) &&
         String(item.sourceMessageId) === String(sourceMessageId)
     );
@@ -529,6 +708,7 @@ async function handleCallback(callback) {
     car.publishedAt = new Date().toISOString();
 
     await saveCars(cars);
+
     await telegram("answerCallbackQuery", {
       callback_query_id: callback.id,
       text: "Автомобиль опубликован!",
@@ -537,12 +717,10 @@ async function handleCallback(callback) {
     await telegram("editMessageText", {
       chat_id: chatId,
       message_id: callback.message.message_id,
-      text: `${text}\n\n✅ АВТОМОБИЛЬ ОПУБЛИКОВАН`,
+      text: `${callback.message.text}\n\n✅ АВТОМОБИЛЬ ОПУБЛИКОВАН`,
     });
 
-    console.log(
-      `Автомобиль опубликован: ${car.id}`
-    );
+    console.log(`Автомобиль опубликован: ${car.id}`);
 
     return;
   }
@@ -582,9 +760,7 @@ async function startBot() {
       });
 
       if (!result.ok) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, 3000)
-        );
+        await new Promise(resolve => setTimeout(resolve, 3000));
         continue;
       }
 
@@ -602,9 +778,7 @@ async function startBot() {
     } catch (error) {
       console.error("Ошибка бота:", error);
 
-      await new Promise((resolve) =>
-        setTimeout(resolve, 3000)
-      );
+      await new Promise(resolve => setTimeout(resolve, 3000));
     }
   }
 }
@@ -612,4 +786,7 @@ async function startBot() {
 console.log("MICOOCAR BOT запущен: @micoocarbot");
 console.log(`ADMIN_ID: ${adminId}`);
 
-startBot();
+(async () => {
+  await syncCarsFromGitHub();
+  await startBot();
+})();
