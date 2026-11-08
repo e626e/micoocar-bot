@@ -1450,6 +1450,204 @@ async function sendAdminStats(chatId) {
   );
 }
 
+// =========================
+// ГЛАВНОЕ МЕНЮ БОТА
+// =========================
+
+const MENU = {
+  catalog: "🚗 Каталог",
+  fresh: "🔥 Новинки",
+  wish: "📝 Подбор авто",
+  calc: "🧮 Растаможка",
+  sold: "🏁 Проданные",
+  subs: "🔔 Мои подписки",
+  how: "ℹ️ Как мы работаем",
+  manager: "👨‍💼 Менеджер",
+  admin: "🛠 Админ-панель",
+};
+
+function menuKeyboard(admin) {
+  const rows = [
+    [{ text: MENU.catalog }, { text: MENU.fresh }],
+    [{ text: MENU.wish }, { text: MENU.calc }],
+    [{ text: MENU.sold }, { text: MENU.subs }],
+    [{ text: MENU.how }, { text: MENU.manager }],
+  ];
+  if (admin) rows.push([{ text: MENU.admin }]);
+  return { reply_markup: { keyboard: rows, resize_keyboard: true, is_persistent: true } };
+}
+
+function webAppButton(text, query = "") {
+  return { text, web_app: { url: `${miniAppUrl}${query}` } };
+}
+
+function shortCarLine(car) {
+  const f = carFacts(car);
+  const parts = [f.year, f.mileage ? `${f.mileage.toLocaleString("ru-RU")} км` : ""].filter(Boolean).join(", ");
+  return `• ${f.title}${parts ? ` (${parts})` : ""}${f.price ? ` — ${formatRub(f.price)}` : ""}`;
+}
+
+function sortByDate(list) {
+  return [...list].sort((a, b) => String(b.publishedAt || "").localeCompare(String(a.publishedAt || "")));
+}
+
+async function handleMenu(chatId, fromId, text, admin) {
+  const cars = readCars();
+  const published = sortByDate(cars.filter(car => car.status === "published"));
+  const sold = [...cars.filter(car => car.status === "hidden")]
+    .sort((a, b) => String(b.soldAt || b.hiddenAt || "").localeCompare(String(a.soldAt || a.hiddenAt || "")));
+
+  if (text === "/start" || text.startsWith("/start ") || text === "/menu") {
+    await sendMessage(
+      chatId,
+      [
+        "🚗 MICOOR CAR — прямой экспортёр авто из Китая",
+        "",
+        "Цены «под ключ» до Уссурийска: покупка, доставка, таможенное оформление и все сопутствующие расходы.",
+        "",
+        `✅ Сейчас в продаже: ${published.length}` + (sold.length ? `\n🏁 Уже продали: ${sold.length}` : ""),
+        "",
+        "Выберите раздел в меню ниже 👇",
+      ].join("\n"),
+      menuKeyboard(admin)
+    );
+    await sendMessage(chatId, "Или сразу откройте каталог:", catalogButton());
+    return true;
+  }
+
+  if (text === MENU.catalog || text === "🚗 Каталог" || text === "/catalog") {
+    const prices = published.map(car => carFacts(car).price).filter(Boolean);
+    const brands = [...new Set(published.map(car => carFacts(car).brand).filter(Boolean))];
+    await sendMessage(
+      chatId,
+      published.length
+        ? [
+            `🚗 В каталоге ${published.length} авто`,
+            prices.length ? `💰 Цены под ключ: от ${formatRub(Math.min(...prices))} до ${formatRub(Math.max(...prices))}` : "",
+            brands.length ? `🏷 Марки: ${brands.slice(0, 8).join(", ")}` : "",
+            "",
+            "Последние поступления:",
+            ...published.slice(0, 3).map(shortCarLine),
+            "",
+            "В каталоге — поиск по параметрам как на Drom, фото и заявка в один тап.",
+          ].filter(line => line !== null).join("\n")
+        : "🚗 Каталог обновляется — новые авто появятся совсем скоро.\n\nА пока можно оставить анкету, и мы подберём машину под вас.",
+      { reply_markup: { inline_keyboard: [[webAppButton("🚗 Открыть каталог")], [webAppButton("📝 Подбор под мой бюджет", "?page=wish")]] } }
+    );
+    return true;
+  }
+
+  if (text === MENU.fresh) {
+    const fresh = published.slice(0, 5);
+    if (!fresh.length) {
+      await sendMessage(chatId, "🔥 Новые авто появятся здесь сразу после публикации в канале.\n\nХотите узнать первым? Оформите подписку на поиск в каталоге.", catalogButton());
+      return true;
+    }
+    await sendMessage(
+      chatId,
+      ["🔥 Новые поступления", "", ...fresh.map(shortCarLine), "", "Нажмите на авто, чтобы открыть карточку 👇"].join("\n"),
+      {
+        reply_markup: {
+          inline_keyboard: [
+            ...fresh.map(car => [webAppButton(`🚗 ${carFacts(car).title}`.slice(0, 60), `?car=${encodeURIComponent(car.id)}`)]),
+            [webAppButton("Весь каталог →")],
+          ],
+        },
+      }
+    );
+    return true;
+  }
+
+  if (text === MENU.wish || text === "📩 Оставить заявку" || text === "/podbor") {
+    await sendMessage(
+      chatId,
+      "📝 Подбор авто под вас\n\nОтветьте на несколько коротких вопросов — кузов, бюджет, год, двигатель, марки. Менеджер подберёт варианты на рынке Китая, а вы сразу увидите, что уже есть в каталоге.\n\nЗаймёт меньше минуты.",
+      { reply_markup: { inline_keyboard: [[webAppButton("📝 Заполнить анкету", "?page=wish")], [{ text: "💬 Написать менеджеру", url: "https://t.me/arturexpo" }]] } }
+    );
+    return true;
+  }
+
+  if (text === MENU.calc || text === "🧮 Калькулятор" || text === "/calc") {
+    await sendMessage(
+      chatId,
+      `🧮 Калькулятор растаможки\n\nПосчитайте таможенные платежи для авто из Китая:\n• единая таможенная ставка\n• таможенный сбор\n• утильсбор\n\nПо курсу ЦБ на сегодня, ставки обновлены ${RATES_UPDATED.split("-").reverse().join(".")}.`,
+      { reply_markup: { inline_keyboard: [[webAppButton("🧮 Открыть калькулятор", "?page=calc")]] } }
+    );
+    return true;
+  }
+
+  if (text === MENU.sold) {
+    await sendMessage(
+      chatId,
+      sold.length
+        ? [`🏁 Мы уже продали ${sold.length} авто`, "", "Последние сделки:", ...sold.slice(0, 5).map(shortCarLine), "", "Понравился какой-то? Подберём такой же."].join("\n")
+        : "🏁 Здесь будет история наших продаж — с фото и характеристиками каждого авто.",
+      { reply_markup: { inline_keyboard: [[webAppButton("🏁 Смотреть проданные", "?page=archive")], [webAppButton("📝 Хочу такой же", "?page=wish")]] } }
+    );
+    return true;
+  }
+
+  if (text === MENU.subs || text === "❤️ Избранное") {
+    const own = subscriptions.filter(sub => sub.userId === fromId);
+    await sendMessage(
+      chatId,
+      own.length
+        ? ["🔔 Ваши подписки", "", ...own.map((sub, index) => `${index + 1}. ${sub.label || "Все автомобили"}${sub.priceDrops ? " · + снижение цены" : ""}`), "", "Бот напишет, как только появится подходящее авто."].join("\n")
+        : "🔔 Подписок пока нет\n\nОткройте каталог, задайте фильтры (марка, бюджет, год) и нажмите «Сообщить о новых» — бот напишет, как только появится подходящее авто.",
+      {
+        reply_markup: {
+          inline_keyboard: [
+            ...own.map((sub, index) => [{ text: `❌ Удалить подписку ${index + 1}`, callback_data: `unsub:${sub.id}` }]),
+            [webAppButton(own.length ? "➕ Новая подписка" : "🔔 Настроить подписку", "?page=catalog")],
+            [webAppButton("❤️ Избранное", "?page=favorites")],
+          ],
+        },
+      }
+    );
+    return true;
+  }
+
+  if (text === MENU.how) {
+    await sendMessage(
+      chatId,
+      [
+        "ℹ️ Как мы работаем",
+        "",
+        "1️⃣ Выбор — авто из каталога или подбор по вашему запросу",
+        "2️⃣ Проверка — согласуем состояние, комплектацию и итоговую цену",
+        "3️⃣ Покупка — выкупаем автомобиль и готовим документы",
+        "4️⃣ Доставка — везём из Китая и проходим таможенное оформление",
+        "5️⃣ Выдача — вы забираете авто в Уссурийске",
+        "6️⃣ Доставка до дома — по желанию привезём автовозом в ваш город",
+        "",
+        "💰 Цена в каталоге — под ключ до Уссурийска, включая:",
+        "✔️ покупку автомобиля",
+        "✔️ доставку",
+        "✔️ таможенное оформление",
+        "✔️ все сопутствующие расходы",
+      ].join("\n"),
+      { reply_markup: { inline_keyboard: [[webAppButton("🚗 Смотреть авто")], [webAppButton("📝 Подобрать под меня", "?page=wish")]] } }
+    );
+    return true;
+  }
+
+  if (text === MENU.manager || text === "👨‍💼 Менеджер") {
+    await sendMessage(
+      chatId,
+      "👨‍💼 Менеджер MICOOR CAR — @arturexpo\n\nОтветит на вопросы по любому авто, посчитает стоимость под ключ и подберёт варианты под ваш бюджет.",
+      { reply_markup: { inline_keyboard: [[{ text: "💬 Написать менеджеру", url: "https://t.me/arturexpo" }], [webAppButton("📝 Оставить анкету", "?page=wish")]] } }
+    );
+    return true;
+  }
+
+  if ((text === MENU.admin || text === "/admin") && admin) {
+    await sendAdminStats(chatId);
+    return true;
+  }
+
+  return false;
+}
+
 async function handleMessage(message) {
   const chatId = message.chat.id;
   const fromId = message.from?.id;
@@ -1494,70 +1692,8 @@ async function handleMessage(message) {
     return;
   }
 
-  if (text === "/start" || text.startsWith("/start ")) {
-    await sendMessage(
-      chatId,
-      "🚗 MICOOR CAR\n\nПрямой экспорт автомобилей из Китая.\nЦены «под ключ» до Уссурийска — с доставкой и растаможкой.",
-      {
-        reply_markup: {
-          keyboard: [
-            [{ text: "🚗 Каталог" }],
-            [{ text: "📩 Оставить заявку" }, { text: "👨‍💼 Менеджер" }],
-          ],
-          resize_keyboard: true,
-        },
-      }
-    );
-
-    await sendMessage(chatId, "Откройте каталог автомобилей 👇", catalogButton());
-    return;
-  }
-
-  if (text === "🧮 Калькулятор" || text === "/calc") {
-    await sendMessage(chatId, "🧮 Посчитайте таможенные платежи для авто из Китая: единая ставка, таможенный сбор и утильсбор по курсу ЦБ.", {
-      reply_markup: {
-        inline_keyboard: [[{ text: "🧮 Открыть калькулятор", web_app: { url: `${miniAppUrl}?page=calc` } }]],
-      },
-    });
-    return;
-  }
-
-  if (text === "🚗 Каталог" || text === "/catalog") {
-    await sendMessage(chatId, "🚗 Каталог MICOOR CAR:", catalogButton());
-    return;
-  }
-
-  if (text === "❤️ Избранное") {
-    await sendMessage(chatId, "❤️ Избранное доступно в каталоге — нажмите на сердечко у авто.", catalogButton());
-    return;
-  }
-
-  if (text === "🧮 Калькулятор") {
-    await sendMessage(chatId, "🧮 Калькулятор скоро появится. А пока менеджер рассчитает стоимость под ваш запрос.");
-    return;
-  }
-
-  if (text === "📩 Оставить заявку" || text === "/podbor") {
-    await sendMessage(
-      chatId,
-      "📝 Ответьте на 7 коротких вопросов — подберём авто под ваш бюджет и пожелания.\n\nИли напишите менеджеру: @arturexpo",
-      {
-        reply_markup: {
-          inline_keyboard: [[{ text: "📝 Заполнить анкету", web_app: { url: `${miniAppUrl}?page=wish` } }]],
-        },
-      }
-    );
-    return;
-  }
-
-  if (text === "👨‍💼 Менеджер") {
-    await sendMessage(chatId, "👨‍💼 Менеджер MICOOR CAR: @arturexpo", {
-      reply_markup: {
-        inline_keyboard: [[{ text: "Написать менеджеру", url: "https://t.me/arturexpo" }]],
-      },
-    });
-    return;
-  }
+  const menu = await handleMenu(chatId, fromId, text, admin);
+  if (menu) return;
 
   if (!admin) return;
 
@@ -1589,6 +1725,26 @@ async function answer(callback, text) {
 
 async function handleCallback(callback) {
   const data = callback.data || "";
+
+  // Удаление подписки — доступно любому пользователю для своих подписок
+  if (data.startsWith("unsub:")) {
+    const id = data.slice(6);
+    const before = subscriptions.length;
+    subscriptions = subscriptions.filter(sub => !(sub.id === id && sub.userId === callback.from?.id));
+
+    if (subscriptions.length !== before) {
+      saveSubscriptions();
+      await answer(callback, "Подписка удалена");
+      await telegram("editMessageText", {
+        chat_id: callback.message.chat.id,
+        message_id: callback.message.message_id,
+        text: "🔔 Подписка удалена. Откройте «🔔 Мои подписки», чтобы увидеть остальные.",
+      });
+    } else {
+      await answer(callback, "Подписка уже удалена");
+    }
+    return;
+  }
 
   if (!isAdmin(callback.from?.id)) {
     await answer(callback, "Только для администратора");
@@ -1686,6 +1842,7 @@ async function startBot() {
   await telegram("setMyCommands", {
     commands: [
       { command: "start", description: "Главное меню" },
+      { command: "menu", description: "Показать меню" },
       { command: "catalog", description: "Каталог автомобилей" },
       { command: "podbor", description: "Анкета подбора авто" },
       { command: "calc", description: "Калькулятор растаможки" },
