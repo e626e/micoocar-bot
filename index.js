@@ -453,7 +453,7 @@ async function telegram(method, body = {}) {
 
   const data = await response.json();
 
-  if (!data.ok) {
+  if (!data.ok && !(method === "getUpdates" && data.error_code === 409)) {
     console.error(`Telegram API error (${method}):`, data.description || data);
   }
 
@@ -1831,8 +1831,16 @@ async function processUpdate(update) {
   if (update.edited_channel_post) await handleChannelPost(update.edited_channel_post, true);
 }
 
+// При деплое Render несколько секунд держит старую и новую копию одновременно.
+// Старая по SIGTERM перестаёт опрашивать Telegram, новая спокойно ждёт.
+let stopPolling = false;
+process.on("SIGTERM", () => {
+  stopPolling = true;
+});
+
 async function startBot() {
   console.log("MICOOCAR BOT запускается...");
+  let conflictLogged = false;
 
   // Кнопка «Каталог» рядом с полем ввода во всех чатах с ботом
   await telegram("setChatMenuButton", {
@@ -1849,7 +1857,7 @@ async function startBot() {
     ],
   });
 
-  while (true) {
+  while (!stopPolling) {
     try {
       const result = await telegram("getUpdates", {
         offset,
@@ -1858,8 +1866,21 @@ async function startBot() {
       });
 
       if (!result.ok) {
-        await sleep(3000);
+        if (result.error_code === 409) {
+          if (!conflictLogged) {
+            console.log("⏳ Старая копия бота ещё работает (обычно при деплое) — жду, пока она остановится...");
+            conflictLogged = true;
+          }
+          await sleep(5000);
+        } else {
+          await sleep(3000);
+        }
         continue;
+      }
+
+      if (conflictLogged) {
+        console.log("✅ Бот снова единственная копия — работаю");
+        conflictLogged = false;
       }
 
       for (const update of result.result) {
