@@ -307,6 +307,213 @@ function saveSubscriptions() {
   return githubQueue;
 }
 
+// =========================
+// ПРОФИЛИ КЛИЕНТОВ И ИСТОРИЯ ЗАЯВОК
+// =========================
+
+const profilesFile = path.join(__dirname, "profiles.json");
+const requestsFile = path.join(__dirname, "requests.json");
+let profiles = {};
+let requests = [];
+
+function loadProfiles() {
+  try {
+    const data = JSON.parse(fs.readFileSync(profilesFile, "utf8"));
+    profiles = data && typeof data === "object" && !Array.isArray(data) ? data : {};
+  } catch {
+    profiles = {};
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(requestsFile, "utf8"));
+    requests = Array.isArray(data) ? data : [];
+  } catch {
+    requests = [];
+  }
+}
+
+function saveProfiles() {
+  fs.writeFileSync(profilesFile, JSON.stringify(profiles));
+  githubQueue = githubQueue.then(() => pushFileToGitHub("profiles.json", profilesFile)).catch(() => {});
+  return githubQueue;
+}
+
+function saveRequests() {
+  // храним последние 3000 заявок
+  if (requests.length > 3000) requests = requests.slice(-3000);
+  fs.writeFileSync(requestsFile, JSON.stringify(requests));
+  githubQueue = githubQueue.then(() => pushFileToGitHub("requests.json", requestsFile)).catch(() => {});
+  return githubQueue;
+}
+
+function profileOf(userId) {
+  return userId ? profiles[String(userId)] || null : null;
+}
+
+function wantsNotifications(userId) {
+  return profileOf(userId)?.notifications !== false;
+}
+
+const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,24}$/;
+
+const REQUEST_STATUS = {
+  new: "🆕 Новая",
+  work: "🟡 В работе",
+  done: "✅ Завершена",
+};
+
+function addRequest({ userId, type, carId, title, summary }) {
+  const item = {
+    id: `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+    userId: userId || null,
+    type,
+    carId: carId || null,
+    title: String(title || "").slice(0, 120),
+    summary: String(summary || "").slice(0, 200),
+    status: "new",
+    createdAt: new Date().toISOString(),
+  };
+  requests.push(item);
+  saveRequests();
+  return item;
+}
+
+function requestKeyboard(item, username) {
+  const rows = [];
+  if (username) rows.push([{ text: "💬 Написать клиенту", url: `https://t.me/${username}` }]);
+  rows.push([
+    { text: `${item.status === "work" ? "● " : ""}🟡 В работе`, callback_data: `lead:${item.id}:work` },
+    { text: `${item.status === "done" ? "● " : ""}✅ Завершена`, callback_data: `lead:${item.id}:done` },
+  ]);
+  if (item.userId) {
+    rows.push([{ text: item.dealId ? "🚗 Покупка оформлена" : "🤝 Клиент купил — вести авто", callback_data: `deal:${item.id}` }]);
+  }
+  return { reply_markup: { inline_keyboard: rows } };
+}
+
+function profileLines(userId) {
+  const profile = profileOf(userId);
+  if (!profile) return [];
+  return [
+    profile.email ? `Почта: ${profile.email}` : null,
+    profile.city ? `Город доставки: ${profile.city}` : null,
+  ].filter(Boolean);
+}
+
+// =========================
+// СДЕЛКИ (ОТСЛЕЖИВАНИЕ АВТО) И ОТЗЫВЫ
+// =========================
+
+const dealsFile = path.join(__dirname, "deals.json");
+const reviewsFile = path.join(__dirname, "reviews.json");
+let deals = [];
+let reviews = [];
+
+const DEAL_STAGES = [
+  { id: "bought", title: "Авто выкуплен", emoji: "🤝" },
+  { id: "shipping", title: "В пути к границе", emoji: "🚛" },
+  { id: "customs", title: "Таможенное оформление", emoji: "🛃" },
+  { id: "delivery", title: "Едет к вам", emoji: "🚚" },
+  { id: "arrived", title: "Авто приехал", emoji: "🎉" },
+];
+const DEAL_STAGE = Object.fromEntries(DEAL_STAGES.map(stage => [stage.id, stage]));
+
+function loadDeals() {
+  try {
+    const data = JSON.parse(fs.readFileSync(dealsFile, "utf8"));
+    deals = Array.isArray(data) ? data : [];
+  } catch {
+    deals = [];
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(reviewsFile, "utf8"));
+    reviews = Array.isArray(data) ? data : [];
+  } catch {
+    reviews = [];
+  }
+}
+
+function saveDeals() {
+  fs.writeFileSync(dealsFile, JSON.stringify(deals));
+  githubQueue = githubQueue.then(() => pushFileToGitHub("deals.json", dealsFile)).catch(() => {});
+  return githubQueue;
+}
+
+function saveReviews() {
+  fs.writeFileSync(reviewsFile, JSON.stringify(reviews));
+  githubQueue = githubQueue.then(() => pushFileToGitHub("reviews.json", reviewsFile)).catch(() => {});
+  return githubQueue;
+}
+
+function clientName(userId) {
+  const profile = profileOf(userId);
+  if (profile?.firstName) return profile.firstName + (profile.username ? ` (@${profile.username})` : "");
+  if (profile?.username) return `@${profile.username}`;
+  return `ID ${userId}`;
+}
+
+function createDeal({ userId, carId, title, adminName }) {
+  const deal = {
+    id: `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+    userId: Number(userId),
+    carId: carId || null,
+    title: String(title || "Автомобиль").slice(0, 120),
+    stage: "bought",
+    history: [{ stage: "bought", note: "", at: new Date().toISOString(), by: adminName || "" }],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  deals.push(deal);
+  saveDeals();
+  return deal;
+}
+
+async function notifyDealUpdate(deal, entry) {
+  const stage = DEAL_STAGE[deal.stage];
+  const stageChanged = entry.stage;
+  const lines = stageChanged
+    ? [`${stage.emoji} ${deal.title}`, "", `Статус: ${stage.title}`]
+    : [`📍 ${deal.title}`, "", "Новая отметка по вашему авто"];
+  if (entry.note) lines.push("", `💬 ${entry.note}`);
+
+  if (stageChanged === "arrived") {
+    lines.push("", "Поздравляем с покупкой! 🙌", "Будем рады, если вы оставите отзыв и пришлёте фото с автомобилем — это займёт минуту.");
+  }
+
+  return sendMessage(deal.userId, lines.join("\n"), {
+    reply_markup: {
+      inline_keyboard: [[webAppButton(stageChanged === "arrived" ? "⭐ Оставить отзыв" : "📍 Где мой автомобиль", "?page=profile")]],
+    },
+  });
+}
+
+function publicDeal(deal) {
+  const review = reviews.find(item => item.dealId === deal.id);
+  return {
+    id: deal.id,
+    carId: deal.carId,
+    title: deal.title,
+    stage: deal.stage,
+    history: deal.history,
+    createdAt: deal.createdAt,
+    reviewStatus: review ? review.status : null,
+  };
+}
+
+function publicReview(review) {
+  return {
+    id: review.id,
+    name: review.name,
+    carTitle: review.carTitle,
+    rating: review.rating,
+    text: review.text,
+    photos: (review.photos || []).map((_, index) => `/api/reviews/${review.id}/photos/${index}`),
+    createdAt: review.createdAt,
+  };
+}
+
+loadProfiles();
+loadDeals();
+
 const FACT_BRANDS = ["Mercedes-Benz", "Mercedes", "Li Auto", "Land Rover", "Volkswagen", "Toyota", "Honda", "Nissan", "Mazda", "Subaru", "Mitsubishi", "Suzuki", "Lexus", "Audi", "BMW", "MINI", "BYD", "Zeekr", "Lixiang", "Kia", "Hyundai", "Genesis", "Porsche", "Ford", "Chevrolet", "Chery", "Geely", "GWM", "Haval", "Tank", "Hongqi", "Avatr", "NIO", "Xiaomi", "XPeng", "JAC", "Jetour", "Voyah", "Denza", "Deepal", "Leapmotor", "Cadillac", "Volvo", "Skoda", "Renault", "Peugeot", "Dongfeng", "Changan", "Wuling", "Buick", "Infiniti", "Acura", "Cupra", "Opel", "Isuzu", "MG", "Smart"];
 const BRAND_CANON = { "mercedes": "Mercedes-Benz", "lixiang": "Li Auto" };
 
@@ -394,6 +601,7 @@ async function notifySubscribers(car, kind, extra = {}) {
 
   for (const sub of subscriptions) {
     if (kind === "price" && !sub.priceDrops) continue;
+    if (!wantsNotifications(sub.userId)) continue;
     if (!subscriptionMatches(sub.filters, facts)) continue;
 
     const text = kind === "price"
@@ -645,7 +853,9 @@ function requireAdmin(req, res, next) {
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "20kb" }));
+const smallJson = express.json({ limit: "20kb" });
+const reviewJson = express.json({ limit: "9mb" });
+app.use((req, res, next) => (req.path === "/api/reviews" ? reviewJson : smallJson)(req, res, next));
 
 const PORT = process.env.PORT || 3000;
 
@@ -852,6 +1062,17 @@ app.post("/api/leads", async (req, res) => {
     const validUsername = /^[A-Za-z0-9_]{5,32}$/.test(cleanUsername);
     const clientTelegram = validUsername ? `@${cleanUsername}` : "username не указан";
 
+    const verifiedUser = validateInitData(req.get("X-Telegram-Init-Data"));
+    const leadUserId = verifiedUser?.id || null;
+    const carTitleText = [brand, model].filter(Boolean).join(" ").replace(/^🔁[^:]*:\s*/, "").slice(0, 120) || "Автомобиль";
+    const request = addRequest({
+      userId: leadUserId,
+      type: "car",
+      carId,
+      title: carTitleText,
+      summary: String(price || "").slice(0, 60),
+    });
+
     const message = [
       "🔥 НОВАЯ ЗАЯВКА MICOOR CAR",
       "",
@@ -865,18 +1086,13 @@ app.post("/api/leads", async (req, res) => {
       `Телефон: ${phoneValue}`,
       `Имя: ${clientName}`,
       `Telegram: ${clientTelegram}`,
-      `Telegram ID: ${userId || "не передан"}`,
+      `Telegram ID: ${leadUserId || userId || "не передан"}`,
+      ...profileLines(leadUserId),
+      "",
+      `Статус: ${REQUEST_STATUS.new}`,
     ].join("\n");
 
-    const extra = validUsername
-      ? {
-          reply_markup: {
-            inline_keyboard: [[
-              { text: "Открыть Telegram клиента", url: `https://t.me/${cleanUsername}` },
-            ]],
-          },
-        }
-      : {};
+    const extra = requestKeyboard(request, validUsername ? cleanUsername : null);
 
     const result = await sendMessage(leadsChatId, message, extra);
 
@@ -971,6 +1187,252 @@ app.delete("/api/subscriptions/:id", requireUser, (req, res) => {
   res.json({ success: true });
 });
 
+// ---------- Профиль клиента ----------
+
+function publicProfile(userId) {
+  const profile = profileOf(userId) || {};
+  return {
+    phone: profile.phone || "",
+    email: profile.email || "",
+    city: profile.city || "",
+    notifications: profile.notifications !== false,
+    createdAt: profile.createdAt || null,
+  };
+}
+
+app.get("/api/profile", requireUser, (req, res) => {
+  const userId = req.telegramUser.id;
+  const own = requests
+    .filter(item => item.userId === userId)
+    .slice(-20)
+    .reverse()
+    .map(({ id, type, carId, title, summary, status, createdAt }) => ({ id, type, carId, title, summary, status, createdAt }));
+
+  res.json({
+    success: true,
+    profile: publicProfile(userId),
+    requests: own,
+    subscriptions: subscriptions.filter(sub => sub.userId === userId),
+    deals: deals.filter(deal => deal.userId === userId).reverse().map(publicDeal),
+    stages: DEAL_STAGES,
+  });
+});
+
+app.put("/api/profile", requireUser, (req, res) => {
+  const user = req.telegramUser;
+  const body = req.body || {};
+
+  const phone = String(body.phone || "").trim().slice(0, 32);
+  const phoneDigits = phone.replace(/\D/g, "");
+  if (phone && (phoneDigits.length < 7 || phoneDigits.length > 15)) {
+    return res.status(400).json({ success: false, field: "phone", error: "Проверьте номер телефона" });
+  }
+
+  const email = String(body.email || "").trim().toLowerCase().slice(0, 254);
+  if (email && !EMAIL_RE.test(email)) {
+    return res.status(400).json({ success: false, field: "email", error: "Проверьте адрес почты" });
+  }
+
+  const city = String(body.city || "").trim().replace(/\s+/g, " ").slice(0, 60);
+  const key = String(user.id);
+  const previous = profiles[key] || {};
+
+  profiles[key] = {
+    ...previous,
+    userId: user.id,
+    firstName: user.first_name || previous.firstName || "",
+    username: user.username || previous.username || "",
+    phone,
+    email,
+    city,
+    notifications: body.notifications !== false,
+    createdAt: previous.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  saveProfiles();
+  res.json({ success: true, profile: publicProfile(user.id) });
+});
+
+// ---------- Сделки: админ ведёт авто клиента ----------
+
+function adminDisplayName(user) {
+  return user.username ? `@${user.username}` : user.first_name || String(user.id);
+}
+
+app.get("/api/admin/deals", requireAdmin, (req, res) => {
+  // клиенты: все, кто оставлял заявки или заполнял профиль
+  const clients = new Map();
+  for (const request of requests) {
+    if (!request.userId) continue;
+    clients.set(request.userId, { userId: request.userId, name: clientName(request.userId), last: request.title });
+  }
+  for (const profile of Object.values(profiles)) {
+    if (!clients.has(profile.userId)) clients.set(profile.userId, { userId: profile.userId, name: clientName(profile.userId), last: "" });
+  }
+
+  res.json({
+    success: true,
+    stages: DEAL_STAGES,
+    deals: [...deals].reverse().map(deal => ({
+      ...publicDeal(deal),
+      userId: deal.userId,
+      client: clientName(deal.userId),
+      phone: profileOf(deal.userId)?.phone || "",
+      city: profileOf(deal.userId)?.city || "",
+    })),
+    clients: [...clients.values()].reverse().slice(0, 300),
+  });
+});
+
+app.post("/api/admin/deals", requireAdmin, async (req, res) => {
+  const userId = Number(req.body?.userId);
+  if (!userId) return res.status(400).json({ success: false, error: "Выберите клиента" });
+
+  const car = req.body?.carId ? readCars().find(item => String(item.id) === String(req.body.carId)) : null;
+  const title = car ? carTitle(car.text) : String(req.body?.title || "").trim();
+  if (!title) return res.status(400).json({ success: false, error: "Укажите автомобиль" });
+
+  const deal = createDeal({ userId, carId: car?.id || null, title, adminName: adminDisplayName(req.telegramUser) });
+
+  if (car && req.body?.markSold !== false && car.status === "published") {
+    const cars = readCars();
+    const target = cars.find(item => item.id === car.id);
+    target.status = "hidden";
+    target.soldAt = new Date().toISOString();
+    saveCars(cars);
+  }
+
+  await notifyDealUpdate(deal, { stage: "bought", note: String(req.body?.note || "").slice(0, 500) });
+  res.json({ success: true, deal: publicDeal(deal) });
+});
+
+app.post("/api/admin/deals/:id", requireAdmin, async (req, res) => {
+  const deal = deals.find(item => item.id === req.params.id);
+  if (!deal) return res.status(404).json({ success: false, error: "Сделка не найдена" });
+
+  const stage = req.body?.stage && DEAL_STAGE[req.body.stage] ? req.body.stage : null;
+  const note = String(req.body?.note || "").trim().slice(0, 500);
+  if (!note && (!stage || stage === deal.stage)) {
+    return res.status(400).json({ success: false, error: "Выберите новый этап или напишите комментарий" });
+  }
+
+  const entry = {
+    stage: stage && stage !== deal.stage ? stage : null,
+    note,
+    at: new Date().toISOString(),
+    by: adminDisplayName(req.telegramUser),
+  };
+  if (entry.stage) deal.stage = entry.stage;
+  deal.history.push(entry);
+  deal.updatedAt = entry.at;
+  saveDeals();
+
+  const sent = await notifyDealUpdate(deal, entry);
+  res.json({ success: true, deal: publicDeal(deal), notified: Boolean(sent?.ok) });
+});
+
+// ---------- Отзывы клиентов ----------
+
+app.get("/api/reviews", (req, res) => {
+  res.json(reviews.filter(review => review.status === "published").reverse().slice(0, 30).map(publicReview));
+});
+
+app.get("/api/reviews/:id/photos/:index", async (req, res) => {
+  const review = reviews.find(item => item.id === req.params.id);
+  const fileId = review?.photos?.[Number(req.params.index)];
+  if (!review || !fileId) return res.status(404).send("Фото не найдено");
+  if (review.status !== "published") {
+    const user = validateInitData(req.get("X-Telegram-Init-Data"));
+    if (!user || !isAdmin(user.id)) return res.status(404).send("Фото не найдено");
+  }
+
+  try {
+    const fileResult = await telegram("getFile", { file_id: fileId });
+    const filePath = fileResult?.result?.file_path;
+    if (!filePath) return res.status(404).send("Файл не найден");
+    const response = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+    if (!response.ok) return res.status(502).send("Не удалось получить фото");
+    res.set("Content-Type", response.headers.get("content-type") || "image/jpeg");
+    res.set("Cache-Control", "public, max-age=604800, immutable");
+    res.send(Buffer.from(await response.arrayBuffer()));
+  } catch (error) {
+    console.error("Ошибка фото отзыва:", error);
+    res.status(500).send("Ошибка сервера");
+  }
+});
+
+async function uploadPhotoToTelegram(chatId, buffer, caption) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (caption) form.append("caption", caption.slice(0, 1000));
+  form.append("photo", new Blob([buffer], { type: "image/jpeg" }), "review.jpg");
+  const response = await fetch(`${api}/sendPhoto`, { method: "POST", body: form });
+  const data = await response.json();
+  if (!data.ok) {
+    console.error("Telegram API error (sendPhoto):", data.description || data);
+    return null;
+  }
+  const sizes = data.result?.photo || [];
+  return sizes[sizes.length - 1]?.file_id || null;
+}
+
+app.post("/api/reviews", requireUser, async (req, res) => {
+  try {
+    const user = req.telegramUser;
+    const deal = deals.find(item => item.id === req.body?.dealId && item.userId === user.id);
+    if (!deal) return res.status(404).json({ success: false, error: "Покупка не найдена" });
+    if (deal.stage !== "arrived") return res.status(400).json({ success: false, error: "Отзыв можно оставить, когда авто приедет" });
+    if (reviews.some(item => item.dealId === deal.id)) return res.status(400).json({ success: false, error: "Вы уже оставили отзыв — спасибо!" });
+
+    const rating = Math.max(1, Math.min(5, Number(req.body?.rating) || 5));
+    const text = String(req.body?.text || "").trim().slice(0, 1500);
+    if (text.length < 3) return res.status(400).json({ success: false, error: "Напишите пару слов о покупке" });
+
+    const rawPhotos = (Array.isArray(req.body?.photos) ? req.body.photos : []).slice(0, 3);
+    const name = user.first_name || (user.username ? `@${user.username}` : "Клиент");
+    const header = `⭐ НОВЫЙ ОТЗЫВ MICOOR CAR\n\n${"★".repeat(rating)}${"☆".repeat(5 - rating)}\n🚗 ${deal.title}\n👤 ${clientName(user.id)}\n\n${text}`;
+
+    const photoIds = [];
+    for (const [index, raw] of rawPhotos.entries()) {
+      const base64 = String(raw || "").replace(/^data:image\/[a-z+]+;base64,/i, "");
+      const buffer = Buffer.from(base64, "base64");
+      if (buffer.length < 1000 || buffer.length > 4 * 1024 * 1024) continue;
+      const fileId = await uploadPhotoToTelegram(leadsChatId, buffer, index === 0 ? `📸 Фото к отзыву: ${deal.title}` : "");
+      if (fileId) photoIds.push(fileId);
+    }
+
+    const review = {
+      id: `v${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+      dealId: deal.id,
+      userId: user.id,
+      name,
+      carTitle: deal.title,
+      rating,
+      text,
+      photos: photoIds,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    };
+    reviews.push(review);
+    saveReviews();
+
+    await sendMessage(leadsChatId, `${header}\n\nФото: ${photoIds.length}\nОпубликовать в мини‑аппе?`, {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ Опубликовать", callback_data: `review:${review.id}:published` },
+          { text: "🙈 Не публиковать", callback_data: `review:${review.id}:hidden` },
+        ]],
+      },
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Ошибка отзыва:", error);
+    res.status(500).json({ success: false, error: "Не удалось отправить отзыв" });
+  }
+});
+
 // ---------- Калькулятор растаможки ----------
 
 app.get("/api/customs", async (req, res) => {
@@ -1032,6 +1494,14 @@ app.post("/api/wishes", async (req, res) => {
     const validUsername = /^[A-Za-z0-9_]{5,32}$/.test(cleanUsername);
     const matchCount = Math.max(0, Math.min(999, Number(matches) || 0));
 
+    const verifiedUser = validateInitData(req.get("X-Telegram-Init-Data"));
+    const wishUserId = verifiedUser?.id || null;
+    const wishSummary = ["body", "budget", "year"]
+      .map(key => cleanList(safeAnswers[key]).join(", "))
+      .filter(Boolean)
+      .join(" · ");
+    const request = addRequest({ userId: wishUserId, type: "wish", title: "Анкета подбора", summary: wishSummary });
+
     const message = [
       "📝 АНКЕТА ПОДБОРА MICOOR CAR",
       "",
@@ -1044,16 +1514,13 @@ app.post("/api/wishes", async (req, res) => {
       `Телефон: ${phoneValue}`,
       `Имя: ${clientName}`,
       `Telegram: ${validUsername ? `@${cleanUsername}` : "username не указан"}`,
-      `Telegram ID: ${Number(userId) || "не передан"}`,
+      `Telegram ID: ${wishUserId || Number(userId) || "не передан"}`,
+      ...profileLines(wishUserId),
+      "",
+      `Статус: ${REQUEST_STATUS.new}`,
     ].filter(line => line !== null).join("\n");
 
-    const extra = validUsername
-      ? {
-          reply_markup: {
-            inline_keyboard: [[{ text: "Написать клиенту", url: `https://t.me/${cleanUsername}` }]],
-          },
-        }
-      : {};
+    const extra = requestKeyboard(request, validUsername ? cleanUsername : null);
 
     const result = await sendMessage(leadsChatId, message, extra);
 
@@ -1442,11 +1909,13 @@ async function sendAdminStats(chatId) {
       `👁 За 7 дней: ${summary.weekViews}`,
       `📩 Заявок и анкет за 7 дней: ${summary.weekLeads}`,
       `🔔 Подписок на поиск: ${subscriptions.length}`,
+      `🚚 Авто в пути у клиентов: ${deals.filter(deal => deal.stage !== "arrived").length}`,
+      `⭐ Отзывов ждут проверки: ${reviews.filter(review => review.status === "pending").length}`,
       top.length ? "\n🔥 Самые просматриваемые:\n" + top.join("\n") : "",
       "",
       "Подробная статистика и архив — в мини-аппе.",
     ].join("\n"),
-    catalogButton("🛠 Открыть мини-апп")
+    { reply_markup: { inline_keyboard: [[webAppButton("🚚 Сделки и отслеживание", "?page=deals")], [webAppButton("🛠 Открыть мини-апп")]] } }
   );
 }
 
@@ -1599,7 +2068,7 @@ async function handleMenu(chatId, fromId, text, admin) {
           inline_keyboard: [
             ...own.map((sub, index) => [{ text: `❌ Удалить подписку ${index + 1}`, callback_data: `unsub:${sub.id}` }]),
             [webAppButton(own.length ? "➕ Новая подписка" : "🔔 Настроить подписку", "?page=catalog")],
-            [webAppButton("❤️ Избранное", "?page=favorites")],
+            [webAppButton("👤 Мой профиль", "?page=profile"), webAppButton("❤️ Избранное", "?page=favorites")],
           ],
         },
       }
@@ -1725,6 +2194,131 @@ async function answer(callback, text) {
 
 async function handleCallback(callback) {
   const data = callback.data || "";
+
+  const fromLeadsChat = String(callback.message?.chat?.id || "") === String(leadsChatId);
+
+  // «Клиент купил» — создаём сделку из заявки
+  if (data.startsWith("deal:")) {
+    if (!fromLeadsChat && !isAdmin(callback.from?.id)) {
+      await answer(callback, "Недоступно");
+      return;
+    }
+    const item = requests.find(request => request.id === data.slice(5));
+    if (!item?.userId) {
+      await answer(callback, "Клиент не найден — оформите покупку в мини‑аппе");
+      return;
+    }
+    if (item.dealId) {
+      await answer(callback, "Покупка уже оформлена — ведите её в мини‑аппе: Профиль → Сделки");
+      return;
+    }
+
+    const deal = createDeal({ userId: item.userId, carId: item.carId, title: item.type === "wish" ? "Автомобиль по анкете" : item.title, adminName: callback.from?.username ? `@${callback.from.username}` : callback.from?.first_name });
+    item.dealId = deal.id;
+    item.status = "done";
+    saveRequests();
+
+    // авто из каталога уходит в «Продано»
+    const cars = readCars();
+    const soldCar = item.carId ? cars.find(car => String(car.id) === String(item.carId) && car.status === "published") : null;
+    if (soldCar) {
+      soldCar.status = "hidden";
+      soldCar.soldAt = new Date().toISOString();
+      saveCars(cars);
+    }
+    await notifyDealUpdate(deal, { stage: "bought", note: "" });
+
+    const username = (callback.message?.reply_markup?.inline_keyboard || []).flat().find(button => button.url)?.url?.replace("https://t.me/", "") || null;
+    await telegram("editMessageText", {
+      chat_id: callback.message.chat.id,
+      message_id: callback.message.message_id,
+      text: (callback.message?.text || "").replace(/\nСтатус: .*$/s, "") + "\nСтатус: 🤝 Клиент купил — авто на отслеживании",
+      ...requestKeyboard(item, username),
+    });
+    await answer(callback, "Покупка оформлена. Этапы — в мини‑аппе: Профиль → Сделки");
+    return;
+  }
+
+  // Модерация отзывов
+  if (data.startsWith("review:")) {
+    if (!fromLeadsChat && !isAdmin(callback.from?.id)) {
+      await answer(callback, "Недоступно");
+      return;
+    }
+    const [, id, status] = data.split(":");
+    const review = reviews.find(item => item.id === id);
+    if (!review || !["published", "hidden"].includes(status)) {
+      await answer(callback, "Отзыв не найден");
+      return;
+    }
+    review.status = status;
+    saveReviews();
+    await telegram("editMessageText", {
+      chat_id: callback.message.chat.id,
+      message_id: callback.message.message_id,
+      text: (callback.message?.text || "").replace(/\nОпубликовать в мини‑аппе\?$/, "") + (status === "published" ? "\n\n✅ Опубликован в мини‑аппе" : "\n\n🙈 Не опубликован"),
+      reply_markup: {
+        inline_keyboard: [[
+          status === "published"
+            ? { text: "🙈 Снять с публикации", callback_data: `review:${id}:hidden` }
+            : { text: "✅ Опубликовать", callback_data: `review:${id}:published` },
+        ]],
+      },
+    });
+    await answer(callback, status === "published" ? "Опубликован" : "Скрыт");
+    return;
+  }
+
+  // Статус заявки — кнопки в группе заявок
+  if (data.startsWith("lead:")) {
+    const [, id, status] = data.split(":");
+    const chatIdOfButton = String(callback.message?.chat?.id || "");
+    if (chatIdOfButton !== String(leadsChatId) && !isAdmin(callback.from?.id)) {
+      await answer(callback, "Недоступно");
+      return;
+    }
+
+    const item = requests.find(request => request.id === id);
+    if (!item || !REQUEST_STATUS[status]) {
+      await answer(callback, "Заявка не найдена");
+      return;
+    }
+    if (item.status === status) {
+      await answer(callback, `Уже: ${REQUEST_STATUS[status]}`);
+      return;
+    }
+
+    item.status = status;
+    item.updatedAt = new Date().toISOString();
+    item.updatedBy = callback.from?.username || callback.from?.first_name || String(callback.from?.id || "");
+    saveRequests();
+
+    const original = callback.message?.text || "";
+    const who = callback.from?.username ? `@${callback.from.username}` : callback.from?.first_name || "менеджер";
+    const newText = original.replace(/\nСтатус: .*$/s, "") + `\nСтатус: ${REQUEST_STATUS[status]} · ${who}`;
+    const username = (callback.message?.reply_markup?.inline_keyboard || [])
+      .flat()
+      .find(button => button.url)?.url?.replace("https://t.me/", "") || null;
+
+    await telegram("editMessageText", {
+      chat_id: callback.message.chat.id,
+      message_id: callback.message.message_id,
+      text: newText,
+      ...requestKeyboard(item, username),
+    });
+    await answer(callback, REQUEST_STATUS[status]);
+
+    if (item.userId) {
+      const what = item.type === "wish" ? "Ваша анкета подбора" : `Ваша заявка на ${item.title}`;
+      const text = status === "work"
+        ? `🟡 ${what} взята в работу.\n\nМенеджер скоро свяжется с вами.`
+        : `✅ ${what} завершена.\n\nСпасибо, что выбрали MICOOR CAR!`;
+      await sendMessage(item.userId, text, {
+        reply_markup: { inline_keyboard: [[webAppButton("👤 Мой профиль", "?page=profile")]] },
+      });
+    }
+    return;
+  }
 
   // Удаление подписки — доступно любому пользователю для своих подписок
   if (data.startsWith("unsub:")) {
@@ -1915,8 +2509,14 @@ if (require.main === module) {
     await syncCarsFromGitHub();
     await syncFileFromGitHub("stats.json", statsFile);
     await syncFileFromGitHub("subscriptions.json", subsFile);
+    await syncFileFromGitHub("profiles.json", profilesFile);
+    await syncFileFromGitHub("requests.json", requestsFile);
+    await syncFileFromGitHub("deals.json", dealsFile);
+    await syncFileFromGitHub("reviews.json", reviewsFile);
     loadStats();
     loadSubscriptions();
+    loadProfiles();
+    loadDeals();
     await startBot();
   })();
 }
