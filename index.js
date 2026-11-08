@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const express = require("express");
+const { calculateCustoms, RATES_UPDATED } = require("./customs");
 const cors = require("cors");
 
 // =========================
@@ -220,6 +221,10 @@ function trackView(carId, viewerKey) {
     if (item.viewers.length > 5000) item.viewers.shift();
   }
 
+  const day = statsDay();
+  item.days = item.days || {};
+  item.days[day] = (item.days[day] || 0) + 1;
+
   dayStats().views += 1;
   statsDirty = true;
   return true;
@@ -254,7 +259,19 @@ function statsSummary() {
   };
 }
 
+function viewsToday(carId) {
+  return stats.cars[String(carId)]?.days?.[statsDay()] || 0;
+}
+
 function saveStats() {
+  // Просмотры по дням для каждой машины — только последние 14 дней
+  const keepFrom = statsDay(14);
+  Object.values(stats.cars).forEach(item => {
+    Object.keys(item.days || {}).forEach(day => {
+      if (day < keepFrom) delete item.days[day];
+    });
+  });
+
   // Храним не больше 120 дней истории
   Object.keys(stats.days)
     .sort()
@@ -266,6 +283,140 @@ function saveStats() {
   githubQueue = githubQueue.then(() => pushFileToGitHub("stats.json", statsFile)).catch(() => {});
   return githubQueue;
 }
+
+
+// =========================
+// ПОДПИСКИ НА ПОИСК
+// =========================
+
+const subsFile = path.join(__dirname, "subscriptions.json");
+let subscriptions = [];
+
+function loadSubscriptions() {
+  try {
+    const data = JSON.parse(fs.readFileSync(subsFile, "utf8"));
+    subscriptions = Array.isArray(data) ? data : [];
+  } catch {
+    subscriptions = [];
+  }
+}
+
+function saveSubscriptions() {
+  fs.writeFileSync(subsFile, JSON.stringify(subscriptions));
+  githubQueue = githubQueue.then(() => pushFileToGitHub("subscriptions.json", subsFile)).catch(() => {});
+  return githubQueue;
+}
+
+const FACT_BRANDS = ["Mercedes-Benz", "Mercedes", "Li Auto", "Land Rover", "Volkswagen", "Toyota", "Honda", "Nissan", "Mazda", "Subaru", "Mitsubishi", "Suzuki", "Lexus", "Audi", "BMW", "MINI", "BYD", "Zeekr", "Lixiang", "Kia", "Hyundai", "Genesis", "Porsche", "Ford", "Chevrolet", "Chery", "Geely", "GWM", "Haval", "Tank", "Hongqi", "Avatr", "NIO", "Xiaomi", "XPeng", "JAC", "Jetour", "Voyah", "Denza", "Deepal", "Leapmotor", "Cadillac", "Volvo", "Skoda", "Renault", "Peugeot", "Dongfeng", "Changan", "Wuling", "Buick", "Infiniti", "Acura", "Cupra", "Opel", "Isuzu", "MG", "Smart"];
+const BRAND_CANON = { "mercedes": "Mercedes-Benz", "lixiang": "Li Auto" };
+
+function digitsOf(value) {
+  return Number(String(value || "").replace(/[^\d]/g, "")) || 0;
+}
+
+// Ключевые параметры авто из текста поста (для подписок и меток)
+function carFacts(car) {
+  const text = String(car.text || car.description || "").replace(/\*/g, "");
+  const title = carTitle(text);
+  let brand = "";
+  let model = "";
+
+  for (const name of FACT_BRANDS) {
+    const match = title.match(new RegExp(`(^|\\s)${name.replace(/[-\s]/g, "[-\\s]")}(\\s|$)`, "i"));
+    if (match) {
+      brand = BRAND_CANON[name.toLowerCase()] || name;
+      model = title.slice(match.index + match[0].length).trim();
+      break;
+    }
+  }
+
+  const words = model.split(/\s+/).filter(Boolean);
+  let family = words[0] || "";
+  if (words[1] && /^(series|class|klasse|серии|класс)$/i.test(words[1])) family = `${words[0]} ${words[1]}`;
+  else if (words[1] && /^[A-ZА-Я]{3,}$/.test(words[0]) && /^[A-ZА-Я]{3,}$/.test(words[1])) family = `${words[0]} ${words[1]}`;
+
+  const priceLine = text.match(/💰\s*([^\n]+)/) || text.match(/Цена\s*[—:–-]?\s*([^\n]+)/i);
+
+  return {
+    title,
+    brand,
+    family,
+    price: priceLine ? digitsOf(priceLine[1]) : 0,
+    year: Number(text.match(/((?:19|20)\d{2})\s*год/i)?.[1]) || 0,
+    mileage: digitsOf(text.match(/Пробег\s*[—:–-]?\s*([\d\s.,]+)\s*км/i)?.[1]),
+    volume: parseFloat(String(text.match(/(\d+(?:[.,]\d+)?)\s*[TТ]?\s*(?:Бензин|Дизель|Гибрид|Электро)/i)?.[1] || "").replace(",", ".")) || 0,
+    power: Number(text.match(/Мощность\s*[—:–-]?\s*(\d+)/i)?.[1]) || 0,
+    fuel: text.match(/(Бензин|Дизель|Гибрид|Электро)/i)?.[1] || "",
+  };
+}
+
+function subscriptionMatches(filters, facts) {
+  const f = filters || {};
+  const n = (value) => digitsOf(value);
+
+  if (f.brand && f.brand !== facts.brand) return false;
+  if (f.model && f.model !== facts.family) return false;
+  if (f.priceFrom && facts.price < n(f.priceFrom)) return false;
+  if (f.priceTo && (!facts.price || facts.price > n(f.priceTo))) return false;
+  if (f.yearFrom && facts.year < Number(f.yearFrom)) return false;
+  if (f.yearTo && (!facts.year || facts.year > Number(f.yearTo))) return false;
+  if (f.mileageTo && facts.mileage > n(f.mileageTo)) return false;
+  if (f.volumeFrom && facts.volume < Number(f.volumeFrom)) return false;
+  if (f.volumeTo && (!facts.volume || facts.volume > Number(f.volumeTo))) return false;
+  if (f.powerFrom && facts.power < n(f.powerFrom)) return false;
+  if (f.powerTo && (!facts.power || facts.power > n(f.powerTo))) return false;
+  if (Array.isArray(f.fuel) && f.fuel.length && !f.fuel.some(item => String(facts.fuel).toLowerCase() === String(item).toLowerCase())) return false;
+  return true;
+}
+
+function formatRub(value) {
+  return `${Number(value).toLocaleString("ru-RU")} ₽`;
+}
+
+function carOpenButton(car, text = "Открыть в каталоге") {
+  return {
+    reply_markup: {
+      inline_keyboard: [[{ text, web_app: { url: `${miniAppUrl}?car=${encodeURIComponent(car.id)}` } }]],
+    },
+  };
+}
+
+async function notifySubscribers(car, kind, extra = {}) {
+  if (!subscriptions.length) return;
+
+  const facts = carFacts(car);
+  const details = [facts.year, facts.mileage ? `${facts.mileage.toLocaleString("ru-RU")} км` : "", facts.fuel]
+    .filter(Boolean)
+    .join(" · ");
+
+  const removed = new Set();
+  let sent = 0;
+
+  for (const sub of subscriptions) {
+    if (kind === "price" && !sub.priceDrops) continue;
+    if (!subscriptionMatches(sub.filters, facts)) continue;
+
+    const text = kind === "price"
+      ? `📉 Цена снижена на авто из вашего поиска\n\n🚗 ${facts.title}\n${details}\n\nБыло: ${formatRub(extra.oldPrice)}\nСтало: ${formatRub(facts.price)} (−${formatRub(extra.oldPrice - facts.price)})`
+      : `🔔 Новое авто по вашему поиску\n\n🚗 ${facts.title}\n${details}${facts.price ? `\n💰 ${formatRub(facts.price)} под ключ` : ""}`;
+
+    const result = await sendMessage(sub.userId, text, carOpenButton(car));
+    if (result?.ok) sent += 1;
+
+    // Пользователь заблокировал бота — подписка больше не нужна
+    if (result && !result.ok && result.error_code === 403) removed.add(sub.id);
+    await sleep(60);
+  }
+
+  if (removed.size) {
+    subscriptions = subscriptions.filter(sub => !removed.has(sub.id));
+    saveSubscriptions();
+  }
+
+  if (sent) console.log(`🔔 Подписчикам отправлено (${kind}): ${sent}`);
+}
+
+loadSubscriptions();
 
 loadStats();
 
@@ -572,7 +723,7 @@ app.get("/api/cars", (req, res) => {
     const cars = readCars()
       .filter(car => car.status === "published" || car.status === "hidden")
       .sort((a, b) => String(b.publishedAt || "").localeCompare(String(a.publishedAt || "")))
-      .map(toPublicCar);
+      .map(car => ({ ...toPublicCar(car), viewsToday: viewsToday(car.id) }));
 
     res.json(cars);
   } catch (error) {
@@ -749,6 +900,96 @@ app.post("/api/leads", async (req, res) => {
   }
 });
 
+// ---------- Подписки на поиск ----------
+
+function requireUser(req, res, next) {
+  const user = validateInitData(req.get("X-Telegram-Init-Data"));
+  if (!user) {
+    return res.status(401).json({ success: false, error: "Откройте каталог через Telegram-бота" });
+  }
+  req.telegramUser = user;
+  next();
+}
+
+function cleanFilters(input) {
+  const f = input && typeof input === "object" ? input : {};
+  const str = (value) => String(value || "").slice(0, 40);
+  return {
+    brand: str(f.brand),
+    model: str(f.model),
+    priceFrom: str(f.priceFrom),
+    priceTo: str(f.priceTo),
+    yearFrom: str(f.yearFrom),
+    yearTo: str(f.yearTo),
+    mileageTo: str(f.mileageTo),
+    volumeFrom: str(f.volumeFrom),
+    volumeTo: str(f.volumeTo),
+    powerFrom: str(f.powerFrom),
+    powerTo: str(f.powerTo),
+    fuel: (Array.isArray(f.fuel) ? f.fuel : []).map(str).slice(0, 4),
+  };
+}
+
+app.get("/api/subscriptions", requireUser, (req, res) => {
+  res.json({ success: true, items: subscriptions.filter(sub => sub.userId === req.telegramUser.id) });
+});
+
+app.post("/api/subscriptions", requireUser, (req, res) => {
+  const userId = req.telegramUser.id;
+  const own = subscriptions.filter(sub => sub.userId === userId);
+
+  if (own.length >= 5) {
+    return res.status(400).json({ success: false, error: "Можно сохранить до 5 поисков — удалите один из старых" });
+  }
+
+  const sub = {
+    id: `sub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    userId,
+    username: req.telegramUser.username || null,
+    filters: cleanFilters(req.body?.filters),
+    label: String(req.body?.label || "").slice(0, 120),
+    priceDrops: req.body?.priceDrops !== false,
+    createdAt: new Date().toISOString(),
+  };
+
+  subscriptions.push(sub);
+  saveSubscriptions();
+
+  const matching = readCars().filter(car => car.status === "published" && subscriptionMatches(sub.filters, carFacts(car))).length;
+  res.json({ success: true, item: sub, matching });
+});
+
+app.delete("/api/subscriptions/:id", requireUser, (req, res) => {
+  const before = subscriptions.length;
+  subscriptions = subscriptions.filter(sub => !(sub.id === req.params.id && sub.userId === req.telegramUser.id));
+
+  if (subscriptions.length === before) {
+    return res.status(404).json({ success: false, error: "Подписка не найдена" });
+  }
+
+  saveSubscriptions();
+  res.json({ success: true });
+});
+
+// ---------- Калькулятор растаможки ----------
+
+app.get("/api/customs", async (req, res) => {
+  try {
+    const result = await calculateCustoms({
+      price: req.query.price,
+      currency: String(req.query.currency || "CNY").toUpperCase(),
+      age: String(req.query.age || "new"),
+      volume: req.query.volume,
+      power: req.query.power,
+      fuel: String(req.query.fuel || "petrol"),
+    });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error("Ошибка расчёта растаможки:", error.message);
+    res.status(503).json({ success: false, error: "Не удалось получить курс ЦБ. Попробуйте через минуту." });
+  }
+});
+
 // ---------- Анкета пожеланий из Mini App ----------
 
 const WISH_LABELS = [
@@ -919,6 +1160,8 @@ async function importChannelCar(messages) {
     `✅ Новое авто в каталоге\n\n🚗 ${carTitle(text)}\n📸 Фото: ${photos.length}\n\nОпубликовано автоматически из канала.`,
     { reply_markup: adminCarKeyboard(car) }
   );
+
+  await notifySubscribers(car, "new");
 }
 
 async function handleChannelEdit(post) {
@@ -949,12 +1192,27 @@ async function handleChannelEdit(post) {
     }
   }
 
+  const oldPrice = carFacts(car).price;
+
   if (text) {
     car.text = text;
     car.description = text;
   }
 
   car.updatedAt = new Date().toISOString();
+
+  // Цена в посте изменилась — метка «Цена снижена» и уведомления
+  const newPrice = carFacts(car).price;
+  let priceDropped = false;
+
+  if (oldPrice && newPrice && newPrice < oldPrice && car.status === "published") {
+    car.oldPrice = Math.max(Number(car.oldPrice) || 0, oldPrice);
+    car.priceDroppedAt = car.updatedAt;
+    priceDropped = true;
+  } else if (oldPrice && newPrice && newPrice >= (Number(car.oldPrice) || Infinity)) {
+    delete car.oldPrice;
+    delete car.priceDroppedAt;
+  }
 
   // В канале написали «ПРОДАНО» — убираем из каталога
   if (text && isSoldPost(text) && car.status === "published") {
@@ -972,6 +1230,11 @@ async function handleChannelEdit(post) {
 
   await saveCars(cars);
   console.log(`✏️ Авто обновлено из канала: ${car.id}`);
+
+  if (priceDropped) {
+    await notifyAdmins(`📉 Цена снижена: ${carTitle(car.text)}\n${formatRub(oldPrice)} → ${formatRub(newPrice)}`);
+    await notifySubscribers(car, "price", { oldPrice });
+  }
 }
 
 async function handleChannelPost(post, isEdit = false) {
@@ -1178,6 +1441,7 @@ async function sendAdminStats(chatId) {
       `👁 Просмотров сегодня: ${summary.todayViews}`,
       `👁 За 7 дней: ${summary.weekViews}`,
       `📩 Заявок и анкет за 7 дней: ${summary.weekLeads}`,
+      `🔔 Подписок на поиск: ${subscriptions.length}`,
       top.length ? "\n🔥 Самые просматриваемые:\n" + top.join("\n") : "",
       "",
       "Подробная статистика и архив — в мини-аппе.",
@@ -1246,6 +1510,15 @@ async function handleMessage(message) {
     );
 
     await sendMessage(chatId, "Откройте каталог автомобилей 👇", catalogButton());
+    return;
+  }
+
+  if (text === "🧮 Калькулятор" || text === "/calc") {
+    await sendMessage(chatId, "🧮 Посчитайте таможенные платежи для авто из Китая: единая ставка, таможенный сбор и утильсбор по курсу ЦБ.", {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🧮 Открыть калькулятор", web_app: { url: `${miniAppUrl}?page=calc` } }]],
+      },
+    });
     return;
   }
 
@@ -1415,6 +1688,7 @@ async function startBot() {
       { command: "start", description: "Главное меню" },
       { command: "catalog", description: "Каталог автомобилей" },
       { command: "podbor", description: "Анкета подбора авто" },
+      { command: "calc", description: "Калькулятор растаможки" },
     ],
   });
 
@@ -1462,7 +1736,9 @@ if (require.main === module) {
   (async () => {
     await syncCarsFromGitHub();
     await syncFileFromGitHub("stats.json", statsFile);
+    await syncFileFromGitHub("subscriptions.json", subsFile);
     loadStats();
+    loadSubscriptions();
     await startBot();
   })();
 }
@@ -1475,4 +1751,6 @@ module.exports = {
   isCarPost,
   isSoldPost,
   readCars,
+  carFacts,
+  subscriptionMatches,
 };
