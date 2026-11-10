@@ -316,12 +316,33 @@ const requestsFile = path.join(__dirname, "requests.json");
 let profiles = {};
 let requests = [];
 
-function loadProfiles() {
+// Контакты (телефон, почта, город) в профилях больше не храним —
+// при загрузке стираем всё, что успело сохраниться раньше.
+const PROFILE_PERSONAL_FIELDS = ["phone", "email", "city", "phoneVerified", "phoneVerifiedAt", "emailVerified", "emailVerifiedAt"];
+
+function stripPersonalData() {
+  let changed = false;
+  for (const profile of Object.values(profiles)) {
+    for (const field of PROFILE_PERSONAL_FIELDS) {
+      if (field in profile) {
+        delete profile[field];
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+function loadProfiles({ persist = false } = {}) {
   try {
     const data = JSON.parse(fs.readFileSync(profilesFile, "utf8"));
     profiles = data && typeof data === "object" && !Array.isArray(data) ? data : {};
   } catch {
     profiles = {};
+  }
+  if (stripPersonalData() && persist) {
+    console.log("🧹 Контакты из профилей стёрты");
+    saveProfiles();
   }
   try {
     const data = JSON.parse(fs.readFileSync(requestsFile, "utf8"));
@@ -353,7 +374,6 @@ function wantsNotifications(userId) {
   return profileOf(userId)?.notifications !== false;
 }
 
-const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,24}$/;
 
 const REQUEST_STATUS = {
   new: "🆕 Новая",
@@ -388,16 +408,6 @@ function requestKeyboard(item, username) {
     rows.push([{ text: item.dealId ? "🚗 Покупка оформлена" : "🤝 Клиент купил — вести авто", callback_data: `deal:${item.id}` }]);
   }
   return { reply_markup: { inline_keyboard: rows } };
-}
-
-function profileLines(userId) {
-  const profile = profileOf(userId);
-  if (!profile) return [];
-  return [
-    profile.phone && profile.phoneVerified ? `Телефон из профиля: ${profile.phone} ✓ подтверждён через Telegram` : null,
-    profile.email ? `Почта: ${profile.email}${profile.emailVerified ? " ✓ подтверждена" : " (не подтверждена)"}` : null,
-    profile.city ? `Город доставки: ${profile.city}` : null,
-  ].filter(Boolean);
 }
 
 // =========================
@@ -1088,7 +1098,6 @@ app.post("/api/leads", async (req, res) => {
       `Имя: ${clientName}`,
       `Telegram: ${clientTelegram}`,
       `Telegram ID: ${leadUserId || userId || "не передан"}`,
-      ...profileLines(leadUserId),
       "",
       `Статус: ${REQUEST_STATUS.new}`,
     ].join("\n");
@@ -1193,14 +1202,8 @@ app.delete("/api/subscriptions/:id", requireUser, (req, res) => {
 function publicProfile(userId) {
   const profile = profileOf(userId) || {};
   return {
-    phone: profile.phone || "",
-    email: profile.email || "",
-    city: profile.city || "",
     notifications: profile.notifications !== false,
     createdAt: profile.createdAt || null,
-    phoneVerified: Boolean(profile.phoneVerified),
-    emailVerified: Boolean(profile.emailVerified),
-    emailVerifyAvailable: Boolean(process.env.RESEND_API_KEY),
   };
 }
 
@@ -1224,158 +1227,19 @@ app.get("/api/profile", requireUser, (req, res) => {
 
 app.put("/api/profile", requireUser, (req, res) => {
   const user = req.telegramUser;
-  const body = req.body || {};
-
-  const phone = String(body.phone || "").trim().slice(0, 32);
-  const phoneDigits = phone.replace(/\D/g, "");
-  if (phone && (phoneDigits.length < 7 || phoneDigits.length > 15)) {
-    return res.status(400).json({ success: false, field: "phone", error: "Проверьте номер телефона" });
-  }
-
-  const email = String(body.email || "").trim().toLowerCase().slice(0, 254);
-  if (email && !EMAIL_RE.test(email)) {
-    return res.status(400).json({ success: false, field: "email", error: "Проверьте адрес почты" });
-  }
-
-  const city = String(body.city || "").trim().replace(/\s+/g, " ").slice(0, 60);
   const key = String(user.id);
   const previous = profiles[key] || {};
 
-  const samePhone = phone.replace(/\D/g, "") === String(previous.phone || "").replace(/\D/g, "");
-  const sameEmail = email === String(previous.email || "").toLowerCase();
-
-  profiles[key] = {
-    ...previous,
-    phoneVerified: Boolean(previous.phoneVerified && samePhone && phone),
-    emailVerified: Boolean(previous.emailVerified && sameEmail && email),
-    userId: user.id,
-    firstName: user.first_name || previous.firstName || "",
-    username: user.username || previous.username || "",
-    phone,
-    email,
-    city,
-    notifications: body.notifications !== false,
-    createdAt: previous.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-
-  saveProfiles();
-  res.json({ success: true, profile: publicProfile(user.id) });
-});
-
-// ---------- Подтверждение почты кодом ----------
-
-const emailCodes = new Map(); // userId -> { email, hash, expires, attempts, sentAt, sentTimes[] }
-const codeSecret = crypto.createHash("sha256").update(`${token}:email-codes`).digest();
-
-function hashCode(userId, email, code) {
-  return crypto.createHmac("sha256", codeSecret).update(`${userId}:${email}:${code}`).digest("hex");
-}
-
-async function sendEmail(to, subject, html, text) {
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from: process.env.MAIL_FROM || "MICOOR CAR <noreply@micoorcar.ru>",
-      to: [to],
-      subject,
-      html,
-      text,
-    }),
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    console.error("Ошибка отправки письма:", response.status, data?.message || data);
-    return false;
-  }
-  return true;
-}
-
-app.post("/api/profile/email/send", requireUser, async (req, res) => {
-  if (!process.env.RESEND_API_KEY) {
-    return res.status(503).json({ success: false, error: "Подтверждение почты скоро заработает" });
-  }
-
-  const userId = req.telegramUser.id;
-  const email = String(req.body?.email || "").trim().toLowerCase().slice(0, 254);
-  if (!EMAIL_RE.test(email)) {
-    return res.status(400).json({ success: false, field: "email", error: "Проверьте адрес почты" });
-  }
-
-  const now = Date.now();
-  const previous = emailCodes.get(userId);
-  const recent = (previous?.sentTimes || []).filter(time => now - time < 60 * 60 * 1000);
-  if (previous && now - previous.sentAt < 60 * 1000) {
-    return res.status(429).json({ success: false, error: "Код уже отправлен. Повторно — через минуту" });
-  }
-  if (recent.length >= 5) {
-    return res.status(429).json({ success: false, error: "Слишком много попыток. Попробуйте через час" });
-  }
-
-  const code = String(crypto.randomInt(100000, 1000000));
-  const ok = await sendEmail(
-    email,
-    `Код подтверждения MICOOR CAR: ${code}`,
-    `<div style="font-family:Arial,sans-serif;font-size:16px;color:#23261b">
-      <p>Здравствуйте!</p>
-      <p>Ваш код подтверждения почты в MICOOR CAR:</p>
-      <p style="font-size:32px;font-weight:bold;letter-spacing:6px;color:#4c5829">${code}</p>
-      <p>Код действует 10 минут. Если вы не запрашивали код — просто проигнорируйте это письмо.</p>
-      <p style="color:#6b6c5c">MICOOR CAR — прямой экспорт автомобилей из Китая</p>
-    </div>`,
-    `Ваш код подтверждения MICOOR CAR: ${code}\nКод действует 10 минут.`
-  );
-
-  if (!ok) {
-    return res.status(502).json({ success: false, error: "Не удалось отправить письмо. Проверьте адрес и попробуйте позже" });
-  }
-
-  emailCodes.set(userId, {
-    email,
-    hash: hashCode(userId, email, code),
-    expires: now + 10 * 60 * 1000,
-    attempts: 0,
-    sentAt: now,
-    sentTimes: [...recent, now],
-  });
-
-  res.json({ success: true });
-});
-
-app.post("/api/profile/email/verify", requireUser, (req, res) => {
-  const user = req.telegramUser;
-  const entry = emailCodes.get(user.id);
-  const code = String(req.body?.code || "").replace(/\D/g, "");
-
-  if (!entry || Date.now() > entry.expires) {
-    return res.status(400).json({ success: false, error: "Код устарел — запросите новый" });
-  }
-  if (entry.attempts >= 5) {
-    return res.status(400).json({ success: false, error: "Слишком много неверных попыток — запросите новый код" });
-  }
-  if (hashCode(user.id, entry.email, code) !== entry.hash) {
-    entry.attempts += 1;
-    return res.status(400).json({ success: false, error: `Неверный код. Осталось попыток: ${5 - entry.attempts}` });
-  }
-
-  emailCodes.delete(user.id);
-  const key = String(user.id);
-  const previous = profiles[key] || {};
   profiles[key] = {
     ...previous,
     userId: user.id,
     firstName: user.first_name || previous.firstName || "",
     username: user.username || previous.username || "",
-    email: entry.email,
-    emailVerified: true,
-    emailVerifiedAt: new Date().toISOString(),
+    notifications: req.body?.notifications !== false,
     createdAt: previous.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+
   saveProfiles();
   res.json({ success: true, profile: publicProfile(user.id) });
 });
@@ -1404,8 +1268,6 @@ app.get("/api/admin/deals", requireAdmin, (req, res) => {
       ...publicDeal(deal),
       userId: deal.userId,
       client: clientName(deal.userId),
-      phone: profileOf(deal.userId)?.phone || "",
-      city: profileOf(deal.userId)?.city || "",
     })),
     clients: [...clients.values()].reverse().slice(0, 300),
   });
@@ -1641,7 +1503,6 @@ app.post("/api/wishes", async (req, res) => {
       `Имя: ${clientName}`,
       `Telegram: ${validUsername ? `@${cleanUsername}` : "username не указан"}`,
       `Telegram ID: ${wishUserId || Number(userId) || "не передан"}`,
-      ...profileLines(wishUserId),
       "",
       `Статус: ${REQUEST_STATUS.new}`,
     ].filter(line => line !== null).join("\n");
@@ -2243,39 +2104,6 @@ async function handleMenu(chatId, fromId, text, admin) {
   return false;
 }
 
-async function handleSharedContact(message) {
-  const contact = message.contact;
-  const fromId = message.from?.id;
-
-  if (!contact.user_id || contact.user_id !== fromId) {
-    await sendMessage(message.chat.id, "Подтвердить можно только свой номер — нажмите кнопку «📱 Поделиться номером».");
-    return;
-  }
-
-  const digits = String(contact.phone_number || "").replace(/\D/g, "");
-  if (digits.length < 7) return;
-
-  const key = String(fromId);
-  const previous = profiles[key] || {};
-  profiles[key] = {
-    ...previous,
-    userId: fromId,
-    firstName: message.from.first_name || previous.firstName || "",
-    username: message.from.username || previous.username || "",
-    phone: `+${digits}`,
-    phoneVerified: true,
-    phoneVerifiedAt: new Date().toISOString(),
-    createdAt: previous.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-  saveProfiles();
-
-  await sendMessage(message.chat.id, `✅ Номер +${digits} подтверждён и сохранён в профиле.`, menuKeyboard(isAdmin(fromId)));
-  await sendMessage(message.chat.id, "Вернуться в профиль:", {
-    reply_markup: { inline_keyboard: [[webAppButton("👤 Мой профиль", "?page=profile")]] },
-  });
-}
-
 async function handleMessage(message) {
   const chatId = message.chat.id;
   const fromId = message.from?.id;
@@ -2284,29 +2112,7 @@ async function handleMessage(message) {
 
   if (!isPrivate) return; // в группах бот только отправляет заявки
 
-  // Клиент поделился номером — подтверждаем, если это его собственный контакт
-  if (message.contact) {
-    await handleSharedContact(message);
-    return;
-  }
-
   const admin = isAdmin(fromId);
-
-  if (text === "/start phone") {
-    await sendMessage(chatId, "📱 Подтвердите номер телефона — нажмите кнопку ниже. Telegram передаст номер вашего аккаунта, вводить ничего не нужно.", {
-      reply_markup: {
-        keyboard: [[{ text: "📱 Поделиться номером", request_contact: true }], [{ text: "↩️ В меню" }]],
-        resize_keyboard: true,
-        one_time_keyboard: true,
-      },
-    });
-    return;
-  }
-
-  if (text === "↩️ В меню") {
-    await sendMessage(chatId, "Главное меню 👇", menuKeyboard(admin));
-    return;
-  }
 
   // Описание для альбома, пересланного без текста
   if (admin && pendingCarDescriptions.has(String(chatId)) && message.text) {
@@ -2696,7 +2502,7 @@ if (require.main === module) {
     await syncFileFromGitHub("reviews.json", reviewsFile);
     loadStats();
     loadSubscriptions();
-    loadProfiles();
+    loadProfiles({ persist: true });
     loadDeals();
     await startBot();
   })();
